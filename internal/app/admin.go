@@ -4,6 +4,7 @@ import (
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,12 @@ import (
 	"sync"
 	"time"
 )
+
+var adminPassword string
+
+func SetAdminPassword(password string) {
+	adminPassword = strings.TrimSpace(password)
+}
 
 // In-memory OAuth login state for async browser login
 var (
@@ -32,10 +39,10 @@ type oauthSessionState struct {
 }
 
 type apiResponse struct {
-	Success bool        `json:"success"`
-	Data    any         `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
-	Message string      `json:"message,omitempty"`
+	Success bool   `json:"success"`
+	Data    any    `json:"data,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 func writeAPI(w http.ResponseWriter, status int, resp apiResponse) {
@@ -45,42 +52,63 @@ func writeAPI(w http.ResponseWriter, status int, resp apiResponse) {
 }
 
 func registerAdminRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/admin/", adminStaticHandler)
-	mux.HandleFunc("/admin/api/accounts", corsHandler(handleAdminAccounts))
-	mux.HandleFunc("/admin/api/accounts/add", corsHandler(handleAdminAccountAdd))
-	mux.HandleFunc("/admin/api/accounts/delete", corsHandler(handleAdminAccountDelete))
-	mux.HandleFunc("/admin/api/accounts/test", corsHandler(handleAdminAccountTest))
-	mux.HandleFunc("/admin/api/oauth/start", corsHandler(handleOAuthStart))
-	mux.HandleFunc("/admin/api/oauth/status", corsHandler(handleOAuthStatus))
-	mux.HandleFunc("/admin/api/sso/import", corsHandler(handleSSOImport))
-	mux.HandleFunc("/admin/api/stats", corsHandler(handleAdminStats))
-	mux.HandleFunc("/admin/api/batch-import", corsHandler(handleBatchImport))
-	mux.HandleFunc("/admin/api/accounts/refresh-all", corsHandler(handleAdminRefreshAll))
-	mux.HandleFunc("/admin/api/accounts/delete-all", corsHandler(handleAdminDeleteAll))
-	mux.HandleFunc("/admin/api/accounts/reset", corsHandler(handleAdminAccountReset))
-	mux.HandleFunc("/admin/api/accounts/export", corsHandler(handleAccountsExport))
-	mux.HandleFunc("/admin/api/logs", corsHandler(handleRequestLogs))
-	mux.HandleFunc("/admin/api/keys", corsHandler(handleAdminGetKeys))
-	mux.HandleFunc("/admin/api/keys/generate", corsHandler(handleAdminGenerateKey))
-	mux.HandleFunc("/admin/api/keys/delete", corsHandler(handleAdminDeleteKey))
-	mux.HandleFunc("/admin/api/models", corsHandler(handleAdminModels))
-	mux.HandleFunc("/admin/api/models/refresh", corsHandler(handleAdminModelsRefresh))
-	mux.HandleFunc("/admin/api/config", corsHandler(handleAdminConfig))
-	mux.HandleFunc("/admin/api/config/update", corsHandler(handleAdminUpdateConfig))
-	mux.HandleFunc("/admin/api/opencode/config", corsHandler(handleZenConfig))
-	mux.HandleFunc("/admin/api/opencode/config/update", corsHandler(handleZenConfigUpdate))
-	mux.HandleFunc("/admin/api/opencode/models", corsHandler(handleZenModels))
-	mux.HandleFunc("/admin/api/opencode/models/refresh", corsHandler(handleZenModelsRefresh))
-	mux.HandleFunc("/admin/api/opencode/stats", corsHandler(handleZenStats))
+	mux.HandleFunc("/admin/", adminAuthHandler(adminStaticHandler))
+	mux.HandleFunc("/admin/api/accounts", adminAuthHandler(corsHandler(handleAdminAccounts)))
+	mux.HandleFunc("/admin/api/accounts/add", adminAuthHandler(corsHandler(handleAdminAccountAdd)))
+	mux.HandleFunc("/admin/api/accounts/delete", adminAuthHandler(corsHandler(handleAdminAccountDelete)))
+	mux.HandleFunc("/admin/api/accounts/test", adminAuthHandler(corsHandler(handleAdminAccountTest)))
+	mux.HandleFunc("/admin/api/oauth/start", adminAuthHandler(corsHandler(handleOAuthStart)))
+	mux.HandleFunc("/admin/api/oauth/status", adminAuthHandler(corsHandler(handleOAuthStatus)))
+	mux.HandleFunc("/admin/api/sso/import", adminAuthHandler(corsHandler(handleSSOImport)))
+	mux.HandleFunc("/admin/api/stats", adminAuthHandler(corsHandler(handleAdminStats)))
+	mux.HandleFunc("/admin/api/batch-import", adminAuthHandler(corsHandler(handleBatchImport)))
+	mux.HandleFunc("/admin/api/accounts/refresh-all", adminAuthHandler(corsHandler(handleAdminRefreshAll)))
+	mux.HandleFunc("/admin/api/accounts/delete-all", adminAuthHandler(corsHandler(handleAdminDeleteAll)))
+	mux.HandleFunc("/admin/api/accounts/reset", adminAuthHandler(corsHandler(handleAdminAccountReset)))
+	mux.HandleFunc("/admin/api/accounts/export", adminAuthHandler(corsHandler(handleAccountsExport)))
+	mux.HandleFunc("/admin/api/logs", adminAuthHandler(corsHandler(handleRequestLogs)))
+	mux.HandleFunc("/admin/api/keys", adminAuthHandler(corsHandler(handleAdminGetKeys)))
+	mux.HandleFunc("/admin/api/keys/generate", adminAuthHandler(corsHandler(handleAdminGenerateKey)))
+	mux.HandleFunc("/admin/api/keys/delete", adminAuthHandler(corsHandler(handleAdminDeleteKey)))
+	mux.HandleFunc("/admin/api/models", adminAuthHandler(corsHandler(handleAdminModels)))
+	mux.HandleFunc("/admin/api/models/refresh", adminAuthHandler(corsHandler(handleAdminModelsRefresh)))
+	mux.HandleFunc("/admin/api/config", adminAuthHandler(corsHandler(handleAdminConfig)))
+	mux.HandleFunc("/admin/api/config/update", adminAuthHandler(corsHandler(handleAdminUpdateConfig)))
+	mux.HandleFunc("/admin/api/opencode/config", adminAuthHandler(corsHandler(handleZenConfig)))
+	mux.HandleFunc("/admin/api/opencode/config/update", adminAuthHandler(corsHandler(handleZenConfigUpdate)))
+	mux.HandleFunc("/admin/api/opencode/models", adminAuthHandler(corsHandler(handleZenModels)))
+	mux.HandleFunc("/admin/api/opencode/models/refresh", adminAuthHandler(corsHandler(handleZenModelsRefresh)))
+	mux.HandleFunc("/admin/api/opencode/stats", adminAuthHandler(corsHandler(handleZenStats)))
 	// 旧 zen 路径别名,兼容旧引用
-	mux.HandleFunc("/admin/api/zen/config", corsHandler(handleZenConfig))
-	mux.HandleFunc("/admin/api/zen/config/update", corsHandler(handleZenConfigUpdate))
-	mux.HandleFunc("/admin/api/zen/models", corsHandler(handleZenModels))
-	mux.HandleFunc("/admin/api/zen/models/refresh", corsHandler(handleZenModelsRefresh))
-	mux.HandleFunc("/admin/api/zen/stats", corsHandler(handleZenStats))
-	mux.HandleFunc("/admin/zen/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/admin/api/zen/config", adminAuthHandler(corsHandler(handleZenConfig)))
+	mux.HandleFunc("/admin/api/zen/config/update", adminAuthHandler(corsHandler(handleZenConfigUpdate)))
+	mux.HandleFunc("/admin/api/zen/models", adminAuthHandler(corsHandler(handleZenModels)))
+	mux.HandleFunc("/admin/api/zen/models/refresh", adminAuthHandler(corsHandler(handleZenModelsRefresh)))
+	mux.HandleFunc("/admin/api/zen/stats", adminAuthHandler(corsHandler(handleZenStats)))
+	mux.HandleFunc("/admin/zen/", adminAuthHandler(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin/", http.StatusFound)
-	})
+	}))
+}
+
+func adminAuthHandler(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if adminPassword == "" {
+			writeAPI(w, http.StatusServiceUnavailable, apiResponse{Error: "admin authentication is disabled; set ADMIN_PASSWORD"})
+			return
+		}
+
+		const user = "admin"
+		_, password, ok := r.BasicAuth()
+		if !ok ||
+			subtle.ConstantTimeCompare([]byte(user), []byte("admin")) != 1 ||
+			subtle.ConstantTimeCompare([]byte(password), []byte(adminPassword)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Cline Proxy Admin", charset="UTF-8"`)
+			writeAPI(w, http.StatusUnauthorized, apiResponse{Error: "unauthorized"})
+			return
+		}
+
+		next(w, r)
+	}
 }
 
 func adminStaticHandler(w http.ResponseWriter, r *http.Request) {

@@ -24,25 +24,106 @@ Cline API 的反向代理服务，支持多账号轮询、OpenAI 和 Anthropic M
 
 ### 直接运行
 
+#### Windows
+
 ```bash
 # 编译并启动（默认监听所有网卡，局域网可访问）
 go build -o cline-proxy.exe .
 ./cline-proxy.exe
 
-# 局域网访问地址：http://<本机局域网IP>:3457/admin/
 # 仅允许本机访问时：
 ./cline-proxy.exe -host 127.0.0.1
 
 # 指定端口
 ./cline-proxy.exe -port 3457
+```
 
+#### macOS / Linux
+
+```bash
+# 编译并启动（默认监听所有网卡，局域网可访问）
+go build -o cline-proxy .
+./cline-proxy
+
+# 仅允许本机访问时：
+./cline-proxy -host 127.0.0.1
+
+# 指定端口
+./cline-proxy -port 3457
+```
+
+局域网访问地址：http://<本机局域网IP>:3457/admin/。
+
+管理后台使用 Basic Auth。启动前设置强密码：
+
+```bash
+export ADMIN_PASSWORD='replace-with-a-long-random-password'
+./cline-proxy -host 127.0.0.1
+```
+
+未设置 `ADMIN_PASSWORD` 时，`/admin/` 会返回 503，不会开放后台。
+
+```bash
 # 构建 + 启动 + 打开浏览器
 go run . -start
 ```
 
 启动后本机访问 http://127.0.0.1:3457/admin/；局域网设备访问 http://<本机局域网IP>:3457/admin/。
 
-监听所有网卡会开放管理后台给同网设备，建议仅在可信局域网使用，并在系统防火墙中限制 3457 端口。
+监听所有网卡会开放服务给同网设备。管理后台有 Basic Auth，但公网部署时建议用反向代理做 HTTPS，并把 `/admin/` 限制到可信访问层；公网客户端只需访问 `/v1/` 代理接口。
+
+### macOS 原生运行说明
+
+#### 环境要求
+
+- macOS Intel 和 Apple Silicon 均支持。
+- Go 1.25 或更高版本；CI 当前使用 Go 1.26。
+- Apple Silicon 使用 `darwin/arm64` 二进制，Intel 使用 `darwin/amd64` 二进制。
+
+已安装 Homebrew 时，可以执行：
+
+```bash
+brew install go
+go version
+```
+
+也可以从 [Go 官方下载页](https://go.dev/dl/) 安装对应版本。进入项目目录后，建议先下载依赖并编译：
+
+```bash
+cd /path/to/Cline-proxy
+go mod download
+go build -o cline-proxy .
+./cline-proxy
+```
+
+管理后台地址为 http://127.0.0.1:3457/admin/；也可以执行以下命令直接打开：
+
+```bash
+open http://127.0.0.1:3457/admin/
+```
+
+从 Release 下载的二进制不是 Apple 签名和公证应用。首次运行若被 Gatekeeper 拦截，可以在 Finder 中右键选择「打开」并确认；命令行用户也可以在确认文件来源可信后执行：
+
+```bash
+chmod +x ./cline-proxy
+xattr -d com.apple.quarantine ./cline-proxy
+```
+
+账号、Key、配置和日志默认保存在可执行文件旁的 `data/` 目录，OAuth 凭据文件保存在可执行文件旁。请将二进制放在当前用户有写权限的目录中，不建议直接放入 `/Applications` 或其他受保护目录。
+
+macOS 当前版本在端口 `3457` 已被占用时，不能像 Windows 一样自动结束占用进程。可以改用其他端口：
+
+```bash
+./cline-proxy -host 127.0.0.1 -port 3458
+open http://127.0.0.1:3458/admin/
+```
+
+或者先查找并结束占用进程：
+
+```bash
+lsof -nP -iTCP:3457 -sTCP:LISTEN
+kill <PID>
+```
 
 ### Docker 部署
 

@@ -1,15 +1,14 @@
 package app
 
 import (
+	"bufio"
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -66,8 +65,6 @@ func StartProxy(host string, port int) error {
 		}
 	}
 	log.Printf("Loaded %d active accounts from pool", activeCount)
-
-	freePort(port)
 
 	startModelsRefresher()
 	startZenModelsRefresher()
@@ -302,6 +299,11 @@ func StartProxy(host string, port int) error {
 	fmt.Println(strings.Repeat("=", 58))
 	fmt.Printf("  http://%s\n", addr)
 	fmt.Printf("  http://%s/v1\n", addr)
+	if adminPassword != "" {
+		fmt.Println("  Admin:   admin / configured via ADMIN_PASSWORD")
+	} else {
+		fmt.Println("  Admin:   DISABLED (set ADMIN_PASSWORD)")
+	}
 	fmt.Println("  API Key: any value")
 	fmt.Printf("  Model:   %s (auto-detected)\n", getDefaultModel())
 	fmt.Printf("  Accounts: %d total, %d active\n", len(loadPool().Accounts), activeCount)
@@ -1922,30 +1924,6 @@ func getNested(obj map[string]any, keys ...any) any {
 		}
 	}
 	return current
-}
-
-func freePort(port int) {
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
-		return // port is free
-	}
-	conn.Close()
-
-	// Try to kill the process using the port
-	cmd := kit.ExecCommand("powershell", "-Command",
-		fmt.Sprintf(`$p=Get-NetTCPConnection -LocalPort %d -ErrorAction SilentlyContinue; if($p){$p.OwningProcess | Sort-Object -Unique | ForEach-Object {Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue}}`, port))
-	_ = cmd.Run()
-	// 杀进程后确认端口确实释放，避免旧进程尚未退出时立刻竞争监听。
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-		if err != nil {
-			return
-		}
-		conn.Close()
-		time.Sleep(100 * time.Millisecond)
-	}
 }
 
 // parseInferenceCapDuration 从 Cline 429 错误体中解析 "Try again in 17h 59m" 形式的等待时长。
