@@ -889,7 +889,7 @@ function copyText(t) {
 }
 
 // ========== 请求日志 ==========
-const ROUTE_LABEL = { zen: 'opencode', cline: 'cline 池', admin: '管理', meta: '元信息', other: '其他' };
+const ROUTE_LABEL = { cline: 'cline 池' };
 const STATUS_CLASS = s => s >= 500 ? 'color:var(--danger)' : (s >= 400 ? 'color:var(--amber)' : 'color:var(--accent2)');
 
 async function loadLogs() {

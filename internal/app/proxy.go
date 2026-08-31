@@ -2,9 +2,9 @@ package app
 
 import (
 	"bufio"
+	"bytes"
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -133,6 +133,9 @@ func StartProxy(host string, port int) error {
 					},
 				})
 				return
+			}
+			if meta, ok := r.Context().Value(apiKeyAuthMetaKey{}).(*apiKeyAuthMeta); ok {
+				meta.authed = true
 			}
 			next(w, r)
 		})

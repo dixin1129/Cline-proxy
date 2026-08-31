@@ -2,12 +2,12 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -39,6 +39,12 @@ var (
 
 var reqLogsFile = kit.ResolveDataPath("requests.jsonl")
 
+type apiKeyAuthMeta struct {
+	authed bool
+}
+
+type apiKeyAuthMetaKey struct{}
+
 // AppendReqLog 记录一条请求日志：内存环形保留 + 异步追加落盘
 func AppendReqLog(l RequestLog) {
 	reqLogsMu.Lock()
@@ -65,7 +71,13 @@ func AppendReqLog(l RequestLog) {
 func LoadRequestLogs() []RequestLog {
 	reqLogsMu.Lock()
 	defer reqLogsMu.Unlock()
-	return reqLogs
+	logs := make([]RequestLog, 0, len(reqLogs))
+	for _, l := range reqLogs {
+		if l.Route == "cline" {
+			logs = append(logs, l)
+		}
+	}
+	return logs
 }
 
 // LoadRequestLogsFromFile 启动时从落盘文件读取尾部记录
@@ -81,6 +93,9 @@ func LoadRequestLogsFromFile() {
 		}
 		var l RequestLog
 		if json.Unmarshal([]byte(line), &l) == nil {
+			if l.Route != "cline" {
+				continue
+			}
 			reqLogs = append(reqLogs, l)
 		}
 	}
@@ -123,14 +138,16 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
-// requestLogMiddleware 记录所有进入代理的请求（API 调用与对话历史）。
+// requestLogMiddleware 提取请求模型并记录 cline 池 API 调用。
 func requestLogMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w}
+		meta := &apiKeyAuthMeta{}
+		r = r.WithContext(context.WithValue(r.Context(), apiKeyAuthMetaKey{}, meta))
 
-		// 读取请求体提取模型，并放回，避免影响后续处理
 		model := ""
+		route := "cline"
 		bodyBytes, _ := io.ReadAll(r.Body)
 		if len(bodyBytes) > 0 {
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -147,16 +164,11 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 		if sw.status == 0 {
 			sw.status = http.StatusOK
 		}
-		route := "other"
-		switch {
-		case strings.HasPrefix(r.URL.Path, "/admin"):
-			route = "admin"
-		case strings.HasPrefix(model, "zen/"):
-			route = "zen"
-		case model != "":
-			route = "cline"
-		case strings.Contains(r.URL.Path, "models") || strings.Contains(r.URL.Path, "health"):
-			route = "meta"
+		if model == "" {
+			return
+		}
+		if !meta.authed || routeModel(model) != "cline" {
+			return
 		}
 		client := r.RemoteAddr
 		if host, _, err := net.SplitHostPort(client); err == nil {
