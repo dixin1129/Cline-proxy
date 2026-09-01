@@ -498,6 +498,10 @@ func buildUpstreamBody(params map[string]any, stream bool) map[string]any {
 		body["reasoning_effort"] = re
 	}
 
+	if model == "" || strings.HasPrefix(model, "z-ai/glm-") {
+		body["enable_thinking"] = true
+	}
+
 	for _, key := range passThroughKeys {
 		if val, ok := params[key]; ok {
 			body[key] = val
@@ -546,6 +550,7 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 		return nil, acc, fmt.Errorf("create request: %w", err)
 	}
 	req.Header = clineHeaders(token, sessionID)
+	req.Header.Set("Accept", "text/event-stream")
 
 	toolCount := 0
 	if tools, ok := params["tools"]; ok {
@@ -714,6 +719,15 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 				if onUsage != nil {
 					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
 						onUsage(u)
+					}
+				}
+				if _, hasChoices := obj["choices"]; !hasChoices {
+					if data, ok := obj["data"].([]any); ok && len(data) > 0 {
+						if dm, ok := data[0].(map[string]any); ok {
+							if _, hasChoices := dm["choices"]; hasChoices {
+								obj = dm
+							}
+						}
 					}
 				}
 				// Some Cline responses wrap in {data: {...}}

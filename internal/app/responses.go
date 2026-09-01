@@ -33,6 +33,14 @@ func responsesToChat(body map[string]any) map[string]any {
 			out[k] = v
 		}
 	}
+	if reasoning, ok := body["reasoning"].(map[string]any); ok {
+		if effort, ok := reasoning["effort"].(string); ok && effort != "" {
+			out["reasoning_effort"] = effort
+		}
+	}
+	if model, _ := body["model"].(string); model == "" || strings.HasPrefix(model, "z-ai/glm-") {
+		out["enable_thinking"] = true
+	}
 	if instr, ok := body["instructions"].(string); ok && instr != "" {
 		out["messages"] = append([]any{map[string]any{"role": "system", "content": instr}}, responsesInputToMessages(body["input"])...)
 	} else {
@@ -155,12 +163,12 @@ func responsesToolsToChat(tools []any) []any {
 // chatToResponses chat.completions 响应 -> Responses 响应
 func chatToResponses(chat map[string]any) map[string]any {
 	resp := map[string]any{
-		"id":         "resp_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
-		"object":     "response",
-		"created_at": time.Now().Unix(),
-		"status":     "completed",
-		"model":      chat["model"],
-		"output":     []any{},
+		"id":          "resp_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
+		"object":      "response",
+		"created_at":  time.Now().Unix(),
+		"status":      "completed",
+		"model":       chat["model"],
+		"output":      []any{},
 		"output_text": "",
 	}
 	choices, _ := chat["choices"].([]any)
@@ -178,11 +186,11 @@ func chatToResponses(chat map[string]any) map[string]any {
 				content = append(content, map[string]any{"type": "output_text", "text": c, "annotations": []any{}})
 			}
 			msgOut := map[string]any{
-				"type":      "message",
-				"id":        "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
-				"status":    "completed",
-				"role":      "assistant",
-				"content":   content,
+				"type":        "message",
+				"id":          "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
+				"status":      "completed",
+				"role":        "assistant",
+				"content":     content,
 				"output_text": outputText.String(),
 			}
 			outputs = append(outputs, msgOut)
@@ -279,10 +287,54 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 	s.event("response.in_progress", map[string]any{"type": "response.in_progress", "response": map[string]any{"id": s.respID}})
 
 	textEmitted := false
+	reasoningEmitted := false
+	reasoningClosed := false
+	var reasoningText strings.Builder
 	callEmitted := false
 	var curCallID, curCallName string
 	var curArgs strings.Builder
 	var outText strings.Builder
+	messageOutputIndex := 0
+	callOutputIndex := 0
+	reasoningID := "rs_" + fmt.Sprintf("%x", time.Now().UnixNano())
+	messageID := "msg_" + fmt.Sprintf("%x", time.Now().UnixNano())
+	closeReasoning := func() {
+		if !reasoningEmitted || reasoningClosed {
+			return
+		}
+		reasoningClosed = true
+		s.event("response.reasoning_summary_text.done", map[string]any{
+			"type":          "response.reasoning_summary_text.done",
+			"item_id":       reasoningID,
+			"output_index":  0,
+			"summary_index": 0,
+			"content_index": 0,
+			"text":          reasoningText.String(),
+		})
+		s.event("response.reasoning_summary_part.done", map[string]any{
+			"type":          "response.reasoning_summary_part.done",
+			"item_id":       reasoningID,
+			"output_index":  0,
+			"summary_index": 0,
+			"part": map[string]any{
+				"type": "summary_text",
+				"text": reasoningText.String(),
+			},
+		})
+		s.event("response.output_item.done", map[string]any{
+			"type":         "response.output_item.done",
+			"output_index": 0,
+			"item": map[string]any{
+				"id":     reasoningID,
+				"type":   "reasoning",
+				"status": "completed",
+				"summary": []any{map[string]any{
+					"type": "summary_text",
+					"text": reasoningText.String(),
+				}},
+			},
+		})
+	}
 
 	reader := bufio.NewReader(upstream.Body)
 	for {
@@ -327,36 +379,70 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 				if c, ok := delta["content"].(string); ok && c != "" {
 					if !textEmitted {
 						textEmitted = true
+						if reasoningEmitted {
+							messageOutputIndex = 1
+						}
+						closeReasoning()
 						s.event("response.output_item.added", map[string]any{
-							"type":       "response.output_item.added",
-							"output_index": 0,
-							"item": map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
+							"type":         "response.output_item.added",
+							"output_index": messageOutputIndex,
+							"item":         map[string]any{"id": messageID, "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
 						})
 						s.event("response.content_part.added", map[string]any{
-							"type": "response.content_part.added",
-							"item_id": s.msgID,
-							"output_index": 0,
+							"type":          "response.content_part.added",
+							"item_id":       messageID,
+							"output_index":  messageOutputIndex,
 							"content_index": 0,
-							"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+							"part":          map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 						})
 					}
 					outText.WriteString(c)
 					s.event("response.output_text.delta", map[string]any{
-						"type": "response.output_text.delta",
-						"item_id": s.msgID,
-						"output_index": 0,
+						"type":          "response.output_text.delta",
+						"item_id":       messageID,
+						"output_index":  messageOutputIndex,
 						"content_index": 0,
-						"delta": c,
+						"delta":         c,
 					})
 				}
 				// 推理
-				if r, ok := delta["reasoning_content"].(string); ok && r != "" {
+				r, _ := delta["reasoning_content"].(string)
+				if r == "" {
+					r, _ = delta["reasoning"].(string)
+				}
+				if r != "" {
+					if !reasoningEmitted {
+						reasoningEmitted = true
+						s.event("response.output_item.added", map[string]any{
+							"type":         "response.output_item.added",
+							"output_index": 0,
+							"item": map[string]any{
+								"id":                reasoningID,
+								"type":              "reasoning",
+								"status":            "in_progress",
+								"summary":           []any{},
+								"encrypted_content": nil,
+							},
+						})
+						s.event("response.reasoning_summary_part.added", map[string]any{
+							"type":          "response.reasoning_summary_part.added",
+							"item_id":       reasoningID,
+							"output_index":  0,
+							"summary_index": 0,
+							"part": map[string]any{
+								"type": "summary_text",
+								"text": "",
+							},
+						})
+					}
+					reasoningText.WriteString(r)
 					s.event("response.reasoning_summary_text.delta", map[string]any{
-						"type": "response.reasoning_summary_text.delta",
-						"item_id": s.msgID,
-						"output_index": 0,
+						"type":          "response.reasoning_summary_text.delta",
+						"item_id":       reasoningID,
+						"output_index":  0,
+						"summary_index": 0,
 						"content_index": 0,
-						"delta": r,
+						"delta":         r,
 					})
 				}
 				// 工具调用
@@ -380,16 +466,20 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 						}
 						if !callEmitted && curCallName != "" {
 							callEmitted = true
+							if reasoningEmitted {
+								callOutputIndex = 1
+							}
+							closeReasoning()
 							s.event("response.output_item.added", map[string]any{
-								"type": "response.output_item.added",
-								"output_index": 1,
+								"type":         "response.output_item.added",
+								"output_index": callOutputIndex,
 								"item": map[string]any{
-									"type": "function_call",
-									"id":   "fc_" + curCallName,
-									"call_id": curCallID,
-									"name": curCallName,
+									"type":      "function_call",
+									"id":        "fc_" + curCallName,
+									"call_id":   curCallID,
+									"name":      curCallName,
 									"arguments": "",
-									"status": "in_progress",
+									"status":    "in_progress",
 								},
 							})
 						}
@@ -403,14 +493,15 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 	}
 
 	// 收尾
+	closeReasoning()
 	if textEmitted {
-		s.event("response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": s.msgID, "output_index": 0, "content_index": 0, "text": outText.String()})
-		s.event("response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": s.msgID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}})
-		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}}}})
+		s.event("response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": messageID, "output_index": messageOutputIndex, "content_index": 0, "text": outText.String()})
+		s.event("response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": messageID, "output_index": messageOutputIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}})
+		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": messageOutputIndex, "item": map[string]any{"id": messageID, "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}}}})
 	}
 	if callEmitted {
-		s.event("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": "fc_" + curCallName, "output_index": 1, "arguments": curArgs.String()})
-		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 1, "item": map[string]any{"type": "function_call", "id": "fc_" + curCallName, "call_id": curCallID, "name": curCallName, "arguments": curArgs.String(), "status": "completed"}})
+		s.event("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": "fc_" + curCallName, "output_index": callOutputIndex, "arguments": curArgs.String()})
+		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": callOutputIndex, "item": map[string]any{"type": "function_call", "id": "fc_" + curCallName, "call_id": curCallID, "name": curCallName, "arguments": curArgs.String(), "status": "completed"}})
 	}
 	s.event("response.completed", map[string]any{
 		"type": "response.completed",
@@ -422,7 +513,13 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			"model":       model,
 			"output":      []any{},
 			"output_text": outText.String(),
-			"usage":       map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+			"usage": map[string]any{
+				"input_tokens":          0,
+				"input_tokens_details":  nil,
+				"output_tokens":         0,
+				"output_tokens_details": nil,
+				"total_tokens":          0,
+			},
 		},
 	})
 }
