@@ -511,13 +511,17 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	defer up.Body.Close()
 
 	usageFn := accountUsageFn(acc, chat)
+	usageFnWithLog := func(u map[string]any) {
+		setRequestLogMetaFromUsage(r, acc, u, chat)
+		usageFn(u)
+	}
 	if isStream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.WriteHeader(http.StatusOK)
-		chatStreamToResponses(w, up, usageFn)
+		chatStreamToResponses(w, up, usageFnWithLog)
 		return
 	}
 	if stream {
@@ -527,7 +531,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
-			usageFn(u)
+			usageFnWithLog(u)
 		}
 		writeJSON(w, http.StatusOK, chatToResponses(out))
 		return
@@ -538,7 +542,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if u, ok := raw["usage"].(map[string]any); ok && len(u) > 0 {
-		usageFn(u)
+		usageFnWithLog(u)
 	}
 	out := raw
 	if data, ok := raw["data"]; ok {

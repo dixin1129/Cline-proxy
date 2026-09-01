@@ -244,9 +244,13 @@ func StartProxy(host string, port int) error {
 		defer resp.Body.Close()
 
 		usageFn := accountUsageFn(acc, params)
+		usageFnWithLog := func(u map[string]any) {
+			setRequestLogMetaFromUsage(r, acc, u, params)
+			usageFn(u)
+		}
 
 		if isStream {
-			handleStreamResponseWithUsage(w, resp, usageFn)
+			handleStreamResponseWithUsage(w, resp, usageFnWithLog)
 			return
 		}
 
@@ -259,7 +263,7 @@ func StartProxy(host string, port int) error {
 				return
 			}
 			if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
-				usageFn(u)
+				usageFnWithLog(u)
 			}
 			out = normalizeOpenAIResponse(out)
 			log.Printf("  nonstream (aggregated): model=%v content_len=%d finish=%v",
@@ -268,7 +272,7 @@ func StartProxy(host string, port int) error {
 			return
 		}
 
-		handleNonStreamResponseWithUsage(w, resp, usageFn)
+		handleNonStreamResponseWithUsage(w, resp, usageFnWithLog)
 	})
 	mux.HandleFunc("/v1/chat/completions", chatHandler)
 	mux.HandleFunc("/chat/completions", chatHandler)
@@ -606,18 +610,31 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 	return resp, acc, nil
 }
 
+func extractUsageTokens(u map[string]any) (int64, int64) {
+	var pt, ct float64
+	if v, ok := u["prompt_tokens"].(float64); ok {
+		pt = v
+	}
+	if v, ok := u["completion_tokens"].(float64); ok {
+		ct = v
+	}
+	return int64(pt), int64(ct)
+}
+
+func setRequestLogMetaFromUsage(r *http.Request, acc *Account, u map[string]any, params map[string]any) {
+	input, output := extractUsageTokens(u)
+	if input+output <= 0 && params != nil {
+		input = int64(estimateJSON(params))
+	}
+	setRequestLogMeta(r, acc.Email, input, output)
+}
+
 // accountUsageFn 构造账号 token 记账回调：从上游 usage 提取
 // prompt_tokens + completion_tokens，计入该账号今日/累计消耗。
 func accountUsageFn(acc *Account, params map[string]any) func(map[string]any) {
 	return func(u map[string]any) {
-		var pt, ct float64
-		if v, ok := u["prompt_tokens"].(float64); ok {
-			pt = v
-		}
-		if v, ok := u["completion_tokens"].(float64); ok {
-			ct = v
-		}
-		tokens := int64(pt + ct)
+		input, output := extractUsageTokens(u)
+		tokens := input + output
 		if tokens <= 0 && params != nil {
 			// 上游未返回 usage 时用入站请求估算兜底（与 zen 统计一致）
 			tokens = int64(estimateJSON(params))
@@ -1436,9 +1453,13 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	usageFn := accountUsageFn(acc, openAIReq)
+	usageFnWithLog := func(u map[string]any) {
+		setRequestLogMetaFromUsage(r, acc, u, openAIReq)
+		usageFn(u)
+	}
 
 	if req.Stream {
-		handleAnthropicStreamWithUsage(w, resp, normalizeRequestModel(req.Model), toolSchemas, usageFn)
+		handleAnthropicStreamWithUsage(w, resp, normalizeRequestModel(req.Model), toolSchemas, usageFnWithLog)
 		return
 	}
 
@@ -1451,7 +1472,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
-			usageFn(u)
+			usageFnWithLog(u)
 		}
 		out = normalizeOpenAIResponse(out)
 		anthropicResp := openAIToAnthropic(out)
@@ -1470,7 +1491,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if u, ok := raw["usage"].(map[string]any); ok && len(u) > 0 {
-		usageFn(u)
+		usageFnWithLog(u)
 	}
 	out := raw
 	if data, ok := raw["data"]; ok {

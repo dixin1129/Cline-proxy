@@ -420,10 +420,10 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>时间</th><th>来源</th><th>方法</th><th>路径</th><th>模型</th><th>路由</th><th>状态</th><th>耗时</th></tr>
+        <tr><th>时间</th><th>来源</th><th>方法</th><th>路径</th><th>模型</th><th>账号</th><th>路由</th><th>输入</th><th>输出</th><th>状态</th><th>耗时</th></tr>
       </thead>
       <tbody id="logsTableBody">
-        <tr><td colspan="8" class="empty">加载中...</td></tr>
+        <tr><td colspan="11" class="empty">加载中...</td></tr>
       </tbody>
     </table>
     </div>
@@ -897,7 +897,7 @@ async function loadLogs() {
     const d = await api('GET', '/logs');
     const logs = d.data.logs || [];
     const tbody = _('logsTableBody');
-    if (!logs.length) { tbody.innerHTML = '<tr><td colspan="8" class="empty">暂无请求记录</td></tr>'; return; }
+    if (!logs.length) { tbody.innerHTML = '<tr><td colspan="11" class="empty">暂无请求记录</td></tr>'; return; }
     tbody.innerHTML = logs.map(l => {
       const t = l.time ? new Date(l.time).toLocaleString('zh-CN') : '-';
       const route = ROUTE_LABEL[l.route] || l.route || '-';
@@ -908,7 +908,10 @@ async function loadLogs() {
         '<td>' + esc(l.method || '-') + '</td>' +
         '<td class="mono" style="font-size:11px">' + esc(l.path || '-') + '</td>' +
         '<td class="mono" style="font-size:12px">' + esc(l.model || '-') + '</td>' +
+        '<td class="mono" style="font-size:11px">' + esc(l.account || '-') + '</td>' +
         '<td><span class="model-tag">' + esc(route) + '</span></td>' +
+        '<td class="mono" style="font-size:11px">' + (l.inputTokens || 0) + '</td>' +
+        '<td class="mono" style="font-size:11px">' + (l.outputTokens || 0) + '</td>' +
         '<td style="font-weight:600;color:' + STATUS_CLASS(st) + '">' + st + '</td>' +
         '<td class="mono" style="font-size:11px">' + (l.durationMs != null ? l.durationMs + ' ms' : '-') + '</td>' +
       '</tr>';

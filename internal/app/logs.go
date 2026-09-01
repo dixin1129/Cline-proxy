@@ -21,9 +21,12 @@ type RequestLog struct {
 	Method   string    `json:"method"`
 	Path     string    `json:"path"`
 	Model    string    `json:"model,omitempty"`
+	Account  string    `json:"account,omitempty"`
 	Route    string    `json:"route"` // zen | cline | admin | other
 	Status   int       `json:"status"`
 	Duration int64     `json:"duration_ms"`
+	Input    int64     `json:"inputTokens,omitempty"`
+	Output   int64     `json:"outputTokens,omitempty"`
 	Note     string    `json:"note,omitempty"`
 }
 
@@ -41,6 +44,33 @@ var reqLogsFile = kit.ResolveDataPath("requests.jsonl")
 
 type apiKeyAuthMeta struct {
 	authed bool
+}
+
+type requestLogMeta struct {
+	account string
+	input   int64
+	output  int64
+}
+
+type requestLogMetaKey struct{}
+
+func withRequestLogMeta(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), requestLogMetaKey{}, &requestLogMeta{}))
+}
+
+func requestLogMetaFrom(r *http.Request) *requestLogMeta {
+	if meta, ok := r.Context().Value(requestLogMetaKey{}).(*requestLogMeta); ok {
+		return meta
+	}
+	return &requestLogMeta{}
+}
+
+func setRequestLogMeta(r *http.Request, account string, input, output int64) {
+	if meta, ok := r.Context().Value(requestLogMetaKey{}).(*requestLogMeta); ok {
+		meta.account = account
+		meta.input = input
+		meta.output = output
+	}
 }
 
 type apiKeyAuthMetaKey struct{}
@@ -144,6 +174,7 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w}
 		meta := &apiKeyAuthMeta{}
+		r = withRequestLogMeta(r)
 		r = r.WithContext(context.WithValue(r.Context(), apiKeyAuthMetaKey{}, meta))
 
 		model := ""
@@ -174,15 +205,19 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 		if host, _, err := net.SplitHostPort(client); err == nil {
 			client = host
 		}
+		logMeta := requestLogMetaFrom(r)
 		AppendReqLog(RequestLog{
 			Time:     time.Now(),
 			Client:   client,
 			Method:   r.Method,
 			Path:     r.URL.Path,
 			Model:    model,
+			Account:  logMeta.account,
 			Route:    route,
 			Status:   sw.status,
 			Duration: time.Since(start).Milliseconds(),
+			Input:    logMeta.input,
+			Output:   logMeta.output,
 		})
 	})
 }
