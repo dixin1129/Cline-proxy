@@ -238,17 +238,17 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
   </div>
 </div>
 <div class="hint" style="margin:-4px 0 16px;padding:11px 14px;border:1px solid var(--border);border-radius:10px;background:rgba(148,163,184,.05)">
-  ℹ️ <strong style="color:var(--text)">Tokens</strong>为本代理本地统计（输入+输出，上游返回 usage 时精确，否则按请求体估算），用于估算离官方限流还有多远；⚡ 测试按钮发起真实探测请求，收到有效回复才标记可用；↻ 重置按钮会<strong style="color:var(--text)">探测上游限流状态</strong>：若上游仍限流则保持冷却并提示恢复时间，探测通过才解除冷却并重置今日统计。
+  ℹ️ <strong style="color:var(--text)">调用次数</strong>和<strong style="color:var(--text)">Tokens</strong>均为本代理本地统计：次数记录成功转发到 Cline 上游的调用，Tokens 记录输入+输出（上游返回 usage 时精确，否则按请求体估算），用于估算离官方限流还有多远；⚡ 测试按钮发起真实探测请求，收到有效回复才标记可用；↻ 重置按钮会<strong style="color:var(--text)">探测上游限流状态</strong>：若上游仍限流则保持冷却并提示恢复时间，探测通过才解除冷却并重置今日统计。
 </div>
 <div class="section">
   <div class="section-body" style="padding:6px">
     <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>邮箱</th><th>状态</th><th title="本代理本地统计，不代表官方免费额度">今日/累计 Tokens</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr>
+        <tr><th>邮箱</th><th>状态</th><th title="本代理本地统计，不代表官方免费额度">今日/累计调用次数</th><th title="本代理本地统计，不代表官方免费额度">今日/累计 Tokens</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr>
       </thead>
       <tbody id="accountTableBody">
-        <tr><td colspan="6" class="empty">加载中...</td></tr>
+        <tr><td colspan="7" class="empty">加载中...</td></tr>
       </tbody>
     </table>
     </div>
@@ -641,7 +641,7 @@ async function loadAccounts() {
     const list = d.data.accounts;
     const tbody = _('accountTableBody');
     if (!list || list.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无账号，前往 <a href="#" onclick="switchTab(\'import\')" style="color:var(--accent);cursor:pointer">导入账号</a> 页添加</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">暂无账号，前往 <a href="#" onclick="switchTab(\'import\')" style="color:var(--accent);cursor:pointer">导入账号</a> 页添加</td></tr>';
       return;
     }
     const sn = { active: '活跃', cooldown: '冷却', expired: '已过期' };
@@ -657,7 +657,8 @@ async function loadAccounts() {
       return '<tr>' +
         '<td>' + esc(a.email) + '</td>' +
         '<td><span class="status ' + a.status + '"><span class="status-dot ' + a.status + '"></span>' + (sn[a.status] || a.status) + '</span>' + statusExtra + '</td>' +
-          '<td title="今日 ' + fmtNum(a.tokensToday) + ' / 累计 ' + fmtNum(a.tokensTotal) + ' tokens（上游返回 usage 时精确，否则为估算值）">' + fmtTokens(a.tokensToday) + ' / ' + fmtTokens(a.tokensTotal) + '</td>' +
+        '<td title="本代理本地成功转发次数，不代表官方免费额度">' + fmtNum(a.usageCountToday) + ' / ' + fmtNum(a.usageCount) + '</td>' +
+        '<td title="今日 ' + fmtNum(a.tokensToday) + ' / 累计 ' + fmtNum(a.tokensTotal) + ' tokens（上游返回 usage 时精确，否则为估算值）">' + fmtTokens(a.tokensToday) + ' / ' + fmtTokens(a.tokensTotal) + '</td>' +
         '<td class="mono" style="font-size:11px">' + lu + '</td>' +
         '<td class="mono" style="font-size:11px">' + cr + '</td>' +
         '<td style="white-space:nowrap">' +
@@ -902,6 +903,7 @@ async function loadLogs() {
       const t = l.time ? new Date(l.time).toLocaleString('zh-CN') : '-';
       const route = ROUTE_LABEL[l.route] || l.route || '-';
       const st = l.status || 0;
+      const durationMs = l.duration_ms != null ? l.duration_ms : l.durationMs;
       return '<tr>' +
         '<td class="mono" style="font-size:11px">' + t + '</td>' +
         '<td class="mono" style="font-size:11px">' + esc(l.client || '-') + '</td>' +
@@ -913,7 +915,7 @@ async function loadLogs() {
         '<td class="mono" style="font-size:11px">' + (l.inputTokens || 0) + '</td>' +
         '<td class="mono" style="font-size:11px">' + (l.outputTokens || 0) + '</td>' +
         '<td style="font-weight:600;color:' + STATUS_CLASS(st) + '">' + st + '</td>' +
-        '<td class="mono" style="font-size:11px">' + (l.durationMs != null ? l.durationMs + ' ms' : '-') + '</td>' +
+        '<td class="mono" style="font-size:11px">' + (durationMs != null ? durationMs + ' ms' : '-') + '</td>' +
       '</tr>';
     }).join('');
   } catch (e) { tbody.innerHTML = '<tr><td colspan="8" class="empty">加载失败</td></tr>'; }

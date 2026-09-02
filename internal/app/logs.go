@@ -83,16 +83,17 @@ func AppendReqLog(l RequestLog) {
 		reqLogs = reqLogs[len(reqLogs)-maxReqLogs:]
 	}
 	reqLogsMu.Unlock()
+	logFile := reqLogsFile
 	go func() {
 		data, _ := json.Marshal(l)
-		f, err := os.OpenFile(reqLogsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
 			return
 		}
 		f.Write(append(data, '\n'))
 		f.Close()
-		if st, err := os.Stat(reqLogsFile); err == nil && st.Size() > maxReqLogsFile {
-			os.WriteFile(reqLogsFile, nil, 0600)
+		if st, err := os.Stat(logFile); err == nil && st.Size() > maxReqLogsFile {
+			os.WriteFile(logFile, nil, 0600)
 		}
 	}()
 }
