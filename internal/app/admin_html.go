@@ -238,7 +238,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
   </div>
 </div>
 <div class="hint" style="margin:-4px 0 16px;padding:11px 14px;border:1px solid var(--border);border-radius:10px;background:rgba(148,163,184,.05)">
-  ℹ️ <strong style="color:var(--text)">Tokens</strong>为本代理本地统计（输入+输出，上游返回 usage 时精确，否则按请求体估算），用于估算离官方限流还有多远；⚡ 测试按钮发起真实探测请求；↻ 重置按钮会<strong style="color:var(--text)">探测上游限流状态</strong>：若上游仍限流则保持冷却并提示恢复时间，探测通过才解除冷却并重置今日统计。
+  ℹ️ <strong style="color:var(--text)">Tokens</strong>为本代理本地统计（输入+输出，上游返回 usage 时精确，否则按请求体估算），用于估算离官方限流还有多远；⚡ 测试按钮发起真实探测请求，收到有效回复才标记可用；↻ 重置按钮会<strong style="color:var(--text)">探测上游限流状态</strong>：若上游仍限流则保持冷却并提示恢复时间，探测通过才解除冷却并重置今日统计。
 </div>
 <div class="section">
   <div class="section-body" style="padding:6px">
@@ -661,7 +661,7 @@ async function loadAccounts() {
         '<td class="mono" style="font-size:11px">' + lu + '</td>' +
         '<td class="mono" style="font-size:11px">' + cr + '</td>' +
         '<td style="white-space:nowrap">' +
-          '<button class="btn btn-sm" onclick="testAccount(\'' + a.accountId + '\', this)" title="测试账号是否可用（成功会清除冷却/过期状态）">⚡</button> ' +
+          '<button class="btn btn-sm" onclick="testAccount(\'' + a.accountId + '\', this)" title="测试账号是否可用（收到有效回复才清除冷却/过期状态）">⚡</button> ' +
           '<button class="btn btn-sm" onclick="resetAccount(\'' + a.accountId + '\', this)" title="检测限流并解除：探测上游，若仍限流则保持冷却并提示恢复时间">↻</button> ' +
           '<button class="btn btn-sm btn-danger" onclick="deleteAccount(\'' + a.accountId + '\')" title="删除">✕</button>' +
         '</td></tr>';
@@ -683,7 +683,7 @@ async function testAccount(id, btn) {
     if (r.cooldownUntil) msg += '\n预计恢复: ' + esc(r.cooldownUntil);
     if (r.remaining) msg += '（剩余 ' + esc(r.remaining) + '）';
     if (r.reason) msg += '\n原因: ' + esc(r.reason);
-    if (r.httpStatus) msg += '\nHTTP: ' + r.httpStatus;
+    if (r.httpStatus) msg += '\n上游 HTTP: ' + r.httpStatus;
     const type = r.status === 'active' ? 'success' : (r.status === 'cooldown' ? 'warning' : 'error');
     toast(msg, type, 6000);
     loadAccounts(); loadStats();

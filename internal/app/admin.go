@@ -1,9 +1,10 @@
 package app
 
 import (
+	"bufio"
+	"bytes"
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
-	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -131,9 +132,9 @@ func handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{
 		Success: true,
 		Data: map[string]any{
-			"accounts":   accounts,
-			"total":      len(accounts),
-			"poolIndex":  loadPool().CurrentIdx,
+			"accounts":  accounts,
+			"total":     len(accounts),
+			"poolIndex": loadPool().CurrentIdx,
 		},
 	})
 }
@@ -609,7 +610,7 @@ func handleAdminAccountReset(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /admin/api/accounts/test  body: { accountId }
-// 用指定账号发送一个 max_tokens=1 的极小探测请求，验证该账号是否可用。
+// 用指定账号发送一个轻量探测请求，验证该账号是否能返回有效助手回复。
 // 如果命中 429/INFERENCE_CAP_ERROR，自动标记冷却并返回预计恢复时间。
 func handleAdminAccountTest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -654,12 +655,20 @@ func handleAdminAccountTest(w http.ResponseWriter, r *http.Request) {
 
 // testAccount 对单个账号执行轻量探测请求，返回详细结果与最终状态。
 // 测试按钮是"升级版重置"：无论账号当前是 active/cooldown/expired，
-// 都会尝试刷新 Token 并发起一次真实探测；成功则清除所有异常状态。
+// 都会尝试刷新 Token 并发起一次真实探测；只有收到有效助手回复才清除异常状态。
 // 返回的 status: active / cooldown / expired / error
 func testAccount(acc *Account) (map[string]any, string) {
 	prevStatus := acc.Status
 	prevCooldownUntil := acc.CooldownUntil
-	_ = prevCooldownUntil
+	prevLastReason := acc.LastReason
+	restorePreviousState := func() {
+		poolMu.Lock()
+		acc.Status = prevStatus
+		acc.CooldownUntil = prevCooldownUntil
+		acc.LastReason = prevLastReason
+		savePoolLocked()
+		poolMu.Unlock()
+	}
 
 	// 取 token（expired/cooldown 也尝试刷新，测试按钮不因状态直接拒绝）
 	token, err := ensureAccountToken(acc)
@@ -679,17 +688,18 @@ func testAccount(acc *Account) (map[string]any, string) {
 		}, "expired"
 	}
 
-	// 构造极小探测请求：max_tokens=1, 单条用户消息。探测请求需与正常代理请求
-	// 使用相同的模型选择、流式策略和任务 ID，否则部分模型会返回空响应。
+	// 构造轻量探测请求：单条用户消息和较小的输出上限。探测请求需与正常代理
+	// 请求使用相同的模型选择、流式策略和任务 ID，否则部分模型会返回空响应。
 	probeModel := getDefaultModel()
 	sessionID := fmt.Sprintf("test_%d", time.Now().UnixMilli())
 	probeBody := map[string]any{
-		"model":            probeModel,
-		"max_tokens":       1,
+		"model": probeModel,
+		// max_tokens=1 在 GLM 的思考模式下可能只产生 reasoning，导致没有最终回复。
+		"max_tokens":       32,
 		"session_id":       sessionID,
 		"reasoning_effort": defaultReasoningEffort,
 		"messages": []map[string]any{
-			{"role": "user", "content": "ping"},
+			{"role": "user", "content": "Reply with exactly: pong"},
 		},
 	}
 	if modelNeedsStream(probeModel) {
@@ -699,6 +709,7 @@ func testAccount(acc *Account) (map[string]any, string) {
 
 	req, err := http.NewRequest("POST", cline.ClineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
 	if err != nil {
+		restorePreviousState()
 		return map[string]any{
 			"accountId": acc.AccountID,
 			"email":     acc.Email,
@@ -707,24 +718,38 @@ func testAccount(acc *Account) (map[string]any, string) {
 		}, "error"
 	}
 	req.Header = clineHeaders(token, sessionID)
+	req.Header.Set("Accept", "text/event-stream")
 
 	resp, err := kit.HTTPClient.Do(req)
 	if err != nil {
 		// 网络错误：5 分钟短冷却
 		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)
 		return map[string]any{
-			"accountId": acc.AccountID,
-			"email":     acc.Email,
-			"status":    "cooldown",
-			"reason":    acc.LastReason,
+			"accountId":     acc.AccountID,
+			"email":         acc.Email,
+			"status":        "cooldown",
+			"reason":        acc.LastReason,
 			"cooldownUntil": acc.CooldownUntil.Format("2006-01-02 15:04:05"),
-			"remaining": formatDuration(time.Until(acc.CooldownUntil)),
+			"remaining":     formatDuration(time.Until(acc.CooldownUntil)),
 		}, "cooldown"
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyBytes, readErr := io.ReadAll(resp.Body)
 	bodyStr := string(bodyBytes)
+	if readErr != nil {
+		markAccountCooldown(acc, "probe response read failed: "+readErr.Error(), 5*time.Minute)
+		return map[string]any{
+			"accountId":     acc.AccountID,
+			"email":         acc.Email,
+			"status":        "cooldown",
+			"reason":        acc.LastReason,
+			"cooldownUntil": acc.CooldownUntil.Format("2006-01-02 15:04:05"),
+			"remaining":     formatDuration(time.Until(acc.CooldownUntil)),
+			"httpStatus":    resp.StatusCode,
+			"probeValid":    false,
+		}, "cooldown"
+	}
 
 	if resp.StatusCode == 429 {
 		duration := parseInferenceCapDuration(bodyStr)
@@ -742,6 +767,7 @@ func testAccount(acc *Account) (map[string]any, string) {
 			"cooldownUntil": acc.CooldownUntil.Format("2006-01-02 15:04:05"),
 			"remaining":     formatDuration(time.Until(acc.CooldownUntil)),
 			"httpStatus":    resp.StatusCode,
+			"probeValid":    false,
 		}, "cooldown"
 	}
 
@@ -758,21 +784,63 @@ func testAccount(acc *Account) (map[string]any, string) {
 			"status":     "expired",
 			"reason":     acc.LastReason,
 			"httpStatus": resp.StatusCode,
+			"probeValid": false,
 		}, "expired"
 	}
 
 	if resp.StatusCode != 200 {
 		// 其它错误：不强制冷却，按一次失败处理
+		restorePreviousState()
 		return map[string]any{
 			"accountId":  acc.AccountID,
 			"email":      acc.Email,
 			"status":     "error",
 			"reason":     fmt.Sprintf("API %d: %s", resp.StatusCode, kit.Truncate(bodyStr, 300)),
 			"httpStatus": resp.StatusCode,
+			"probeValid": false,
 		}, "error"
 	}
 
-	// 成功：清除所有异常状态（冷却/过期/原因），并递增使用计数
+	// 上游可能在 HTTP 200 下返回空响应、错误事件或只有 reasoning 的 SSE。
+	// 仅凭状态码不能证明账号真的能回复，必须验证响应体中的有效 assistant 输出。
+	validation := validateProbeResponse(bodyBytes)
+	if !validation.valid {
+		reason := validation.reason
+		if reason == "" {
+			reason = "no valid assistant reply"
+		}
+		if validation.rateLimited {
+			duration := parseInferenceCapDuration(bodyStr)
+			if duration <= 0 {
+				duration = parseRetryAfter(resp.Header.Get("Retry-After"))
+			}
+			markAccountCooldown(acc, "200 probe rate limit: "+kit.Truncate(bodyStr, 500), duration)
+			log.Printf("Test hit embedded rate limit on %s, cooldown %v", truncateEmail(acc.Email), duration)
+			return map[string]any{
+				"accountId":     acc.AccountID,
+				"email":         acc.Email,
+				"status":        "cooldown",
+				"reason":        acc.LastReason,
+				"cooldownUntil": acc.CooldownUntil.Format("2006-01-02 15:04:05"),
+				"remaining":     formatDuration(time.Until(acc.CooldownUntil)),
+				"httpStatus":    resp.StatusCode,
+				"probeValid":    false,
+			}, "cooldown"
+		}
+
+		restorePreviousState()
+		return map[string]any{
+			"accountId":  acc.AccountID,
+			"email":      acc.Email,
+			"status":     "error",
+			"reason":     reason,
+			"httpStatus": resp.StatusCode,
+			"probeValid": false,
+			"prevStatus": prevStatus,
+		}, "error"
+	}
+
+	// 成功：确认收到有效 assistant 输出后，才清除所有异常状态（冷却/过期/原因）。
 	poolMu.Lock()
 	acc.Status = "active"
 	acc.LastReason = ""
@@ -783,10 +851,231 @@ func testAccount(acc *Account) (map[string]any, string) {
 		"accountId":  acc.AccountID,
 		"email":      acc.Email,
 		"status":     "active",
-		"reason":     "ok",
+		"reason":     "ok: assistant reply received",
 		"httpStatus": resp.StatusCode,
 		"prevStatus": prevStatus,
+		"probeValid": true,
 	}, "active"
+}
+
+type probeValidation struct {
+	valid       bool
+	rateLimited bool
+	reason      string
+}
+
+// validateProbeResponse 验证探测响应中是否存在有效的 assistant 文本或 tool call。
+// Cline 上游通常返回 chat-completions JSON 或 SSE；两种格式都可能在 HTTP 200
+// 下携带错误，所以不能只看响应状态码。
+func validateProbeResponse(body []byte) probeValidation {
+	raw := strings.TrimSpace(string(body))
+	if raw == "" {
+		return probeValidation{reason: "empty upstream response"}
+	}
+	if isProbeRateLimitText(raw) {
+		return probeValidation{rateLimited: true, reason: "upstream rate-limit response"}
+	}
+
+	var obj map[string]any
+	if json.Unmarshal(body, &obj) == nil {
+		return validateProbeObject(obj)
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	scanner.Buffer(make([]byte, 4096), 2*1024*1024)
+	sawData := false
+	var firstFailure probeValidation
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		sawData = true
+
+		var event map[string]any
+		if json.Unmarshal([]byte(payload), &event) != nil {
+			continue
+		}
+		result := validateProbeObject(event)
+		if result.rateLimited {
+			return result
+		}
+		if result.valid {
+			return result
+		}
+		if firstFailure.reason == "" {
+			firstFailure = result
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return probeValidation{reason: "read SSE response: " + err.Error()}
+	}
+	if firstFailure.reason != "" {
+		return firstFailure
+	}
+	if sawData {
+		return probeValidation{reason: "SSE contained no assistant reply"}
+	}
+	return probeValidation{reason: "invalid upstream response"}
+}
+
+func validateProbeObject(obj map[string]any) probeValidation {
+	if reason, ok := probeObjectError(obj); ok {
+		return probeValidation{
+			rateLimited: isProbeRateLimitText(reason),
+			reason:      "upstream error: " + reason,
+		}
+	}
+
+	obj = unwrapProbeObject(obj)
+	if reason, ok := probeObjectError(obj); ok {
+		return probeValidation{
+			rateLimited: isProbeRateLimitText(reason),
+			reason:      "upstream error: " + reason,
+		}
+	}
+	if probeObjectHasAssistantOutput(obj) {
+		return probeValidation{valid: true}
+	}
+	return probeValidation{reason: "response contained no assistant text or tool call"}
+}
+
+func unwrapProbeObject(obj map[string]any) map[string]any {
+	for i := 0; i < 3; i++ {
+		if _, ok := obj["choices"]; ok {
+			return obj
+		}
+		switch data := obj["data"].(type) {
+		case map[string]any:
+			obj = data
+		case []any:
+			if len(data) == 0 {
+				return obj
+			}
+			if nested, ok := data[0].(map[string]any); ok {
+				obj = nested
+				continue
+			}
+			return obj
+		default:
+			return obj
+		}
+	}
+	return obj
+}
+
+func probeObjectError(obj map[string]any) (string, bool) {
+	if value, ok := obj["error"]; ok && value != nil {
+		return probeValueText(value), true
+	}
+	if status, ok := obj["status"].(string); ok && strings.EqualFold(status, "error") {
+		if message, ok := obj["message"].(string); ok && strings.TrimSpace(message) != "" {
+			return message, true
+		}
+		return "status=error", true
+	}
+	for _, key := range []string{"code", "type"} {
+		value, ok := obj[key].(string)
+		if ok && (strings.Contains(strings.ToLower(value), "error") || isProbeRateLimitText(value)) {
+			if message, ok := obj["message"].(string); ok && strings.TrimSpace(message) != "" {
+				return message, true
+			}
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func probeValueText(value any) string {
+	if text, ok := value.(string); ok {
+		return text
+	}
+	if obj, ok := value.(map[string]any); ok {
+		for _, key := range []string{"message", "code", "type"} {
+			if text, ok := obj[key].(string); ok && strings.TrimSpace(text) != "" {
+				return text
+			}
+		}
+	}
+	encoded, err := json.Marshal(value)
+	if err == nil {
+		return string(encoded)
+	}
+	return fmt.Sprint(value)
+}
+
+func probeObjectHasAssistantOutput(obj map[string]any) bool {
+	choices, ok := obj["choices"].([]any)
+	if !ok {
+		return false
+	}
+	for _, rawChoice := range choices {
+		choice, ok := rawChoice.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, key := range []string{"message", "delta"} {
+			part, ok := choice[key].(map[string]any)
+			if !ok {
+				continue
+			}
+			if probeHasText(part["content"]) || probeHasToolCall(part) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func probeHasText(value any) bool {
+	switch text := value.(type) {
+	case string:
+		return strings.TrimSpace(text) != ""
+	case []any:
+		for _, item := range text {
+			if probeHasText(item) {
+				return true
+			}
+			if obj, ok := item.(map[string]any); ok {
+				if probeHasText(obj["text"]) || probeHasText(obj["content"]) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func probeHasToolCall(part map[string]any) bool {
+	if calls, ok := part["tool_calls"].([]any); ok && len(calls) > 0 {
+		return true
+	}
+	if call, ok := part["function_call"].(map[string]any); ok && len(call) > 0 {
+		return true
+	}
+	return false
+}
+
+func isProbeRateLimitText(text string) bool {
+	upper := strings.ToUpper(text)
+	for _, marker := range []string{
+		"INFERENCE_CAP_ERROR",
+		"TRY AGAIN IN",
+		"TOO MANY REQUESTS",
+		"RATE_LIMIT",
+		"RATE LIMIT",
+		"DAILY FREE LIMIT",
+		"QUOTA_EXCEEDED",
+	} {
+		if strings.Contains(upper, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func formatDuration(d time.Duration) string {
