@@ -2,6 +2,7 @@ package app
 
 import (
 	"cline-go-proxy/internal/kit"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -118,4 +119,90 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+// 测试按钮在刷新 token 遇到临时故障（DNS/网络中断）时不得改变账号状态。
+func TestTestAccountKeepsStatusOnTransientRefreshFailure(t *testing.T) {
+	oldClient := kit.HTTPClient
+	oldPool := pool
+	oldPoolPath := poolPath
+	oldDelay := tokenRefreshDelay
+	t.Cleanup(func() {
+		kit.HTTPClient = oldClient
+		pool = oldPool
+		poolPath = oldPoolPath
+		tokenRefreshDelay = oldDelay
+	})
+
+	tokenRefreshDelay = 0
+	poolPath = t.TempDir() + "/accounts.json"
+	cooldownUntil := time.Now().Add(time.Hour)
+	acc := &Account{
+		AccountID:     "transient-test",
+		Email:         "transient@example.com",
+		RefreshToken:  "rt",
+		AccessToken:   "expired-access",
+		ExpiresAt:     time.Now().Add(-time.Minute).UnixMilli(),
+		Status:        "cooldown",
+		CooldownUntil: cooldownUntil,
+		LastReason:    "429: daily limit",
+	}
+	pool = &AccountPool{Accounts: []*Account{acc}}
+	kit.HTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("dial tcp: lookup api.cline.bot: no such host")
+	})}
+
+	result, status := testAccount(acc)
+	if status != "error" {
+		t.Fatalf("status = %q, want error; result=%+v", status, result)
+	}
+	if acc.Status != "cooldown" {
+		t.Fatalf("account status = %q, want cooldown preserved", acc.Status)
+	}
+	if !acc.CooldownUntil.Equal(cooldownUntil) {
+		t.Fatalf("cooldownUntil = %v, want %v", acc.CooldownUntil, cooldownUntil)
+	}
+	if acc.LastReason != "429: daily limit" {
+		t.Fatalf("lastReason = %q, want previous reason preserved", acc.LastReason)
+	}
+}
+
+// 测试按钮在 refresh token 确认失效时才标记过期。
+func TestTestAccountExpiresOnInvalidGrant(t *testing.T) {
+	oldClient := kit.HTTPClient
+	oldPool := pool
+	oldPoolPath := poolPath
+	oldDelay := tokenRefreshDelay
+	t.Cleanup(func() {
+		kit.HTTPClient = oldClient
+		pool = oldPool
+		poolPath = oldPoolPath
+		tokenRefreshDelay = oldDelay
+	})
+
+	tokenRefreshDelay = 0
+	poolPath = t.TempDir() + "/accounts.json"
+	acc := &Account{
+		AccountID:    "invalid-grant-test",
+		Email:        "invalid@example.com",
+		RefreshToken: "rt",
+		AccessToken:  "expired-access",
+		ExpiresAt:    time.Now().Add(-time.Minute).UnixMilli(),
+		Status:       "active",
+	}
+	pool = &AccountPool{Accounts: []*Account{acc}}
+	kit.HTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Body:       io.NopCloser(strings.NewReader(`{"error":"failed to refresh token: invalid_grant"}`)),
+		}, nil
+	})}
+
+	result, status := testAccount(acc)
+	if status != "expired" {
+		t.Fatalf("status = %q, want expired; result=%+v", status, result)
+	}
+	if acc.Status != "expired" {
+		t.Fatalf("account status = %q, want expired", acc.Status)
+	}
 }

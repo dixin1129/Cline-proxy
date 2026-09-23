@@ -4,12 +4,30 @@ import (
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"sync"
 	"time"
 )
+
+var (
+	// tokenRefreshAttempts 首次刷新失败后的重试次数上限（不含首次）。
+	tokenRefreshAttempts = 2
+	// tokenRefreshDelay 重试退避基数，随尝试次数线性增长；测试中可置零。
+	tokenRefreshDelay = 500 * time.Millisecond
+	// tokenRecoveryInterval 后台自动重试 expired 账号的间隔。
+	tokenRecoveryInterval = 10 * time.Minute
+	// refreshLocks 按账号串行化 token 刷新：并发刷新会争抢轮换后的
+	// refresh token，慢的一方可能拿到 invalid_grant 而被误判过期。
+	refreshLocks sync.Map // accountID -> *sync.Mutex
+)
+
+func accountRefreshLock(acc *Account) *sync.Mutex {
+	l, _ := refreshLocks.LoadOrStore(acc.AccountID, &sync.Mutex{})
+	return l.(*sync.Mutex)
+}
 
 var (
 	pool       *AccountPool
@@ -130,10 +148,30 @@ func getAccountByID(accountID string) *Account {
 }
 
 func refreshAccountToken(acc *Account) error {
+	return refreshAccountTokenRetry(acc, tokenRefreshAttempts)
+}
+
+// refreshAccountTokenRetry 刷新 token，遇到临时故障最多重试 retries 次。
+// 仅在确认 refresh token 永久失效时把账号标记为 expired。
+func refreshAccountTokenRetry(acc *Account, retries int) error {
+	lock := accountRefreshLock(acc)
+	lock.Lock()
+	defer lock.Unlock()
+
 	resp, err := cline.RefreshClineToken(acc.RefreshToken)
+	// 仅对临时故障（网络、5xx、429）重试；invalid_grant 等永久失效立即放弃。
+	for attempt := 1; err != nil && attempt <= retries && !errors.Is(err, cline.ErrRefreshTokenInvalid); attempt++ {
+		time.Sleep(time.Duration(attempt) * tokenRefreshDelay)
+		resp, err = cline.RefreshClineToken(acc.RefreshToken)
+	}
 	if err != nil {
 		poolMu.Lock()
-		acc.Status = "expired"
+		// 只有 refresh token 本身失效才标记过期；网络抖动等临时故障保留原状态，
+		// 否则一次 DNS 失败就会把可用账号打成 expired，只能靠手动测试恢复。
+		if errors.Is(err, cline.ErrRefreshTokenInvalid) {
+			acc.Status = "expired"
+		}
+		acc.LastReason = "token refresh failed: " + err.Error()
 		savePoolLocked()
 		poolMu.Unlock()
 		return fmt.Errorf("token refresh failed: %w", err)
@@ -145,10 +183,46 @@ func refreshAccountToken(acc *Account) error {
 		acc.RefreshToken = resp.Data.RefreshToken
 	}
 	acc.ExpiresAt = cline.ParseExpiry(resp.Data.ExpiresAt) - 60000
-	acc.Status = "active"
+	// 刷新成功只说明 token 有效，不代表上游已解除限流，冷却状态需保留。
+	if acc.Status != "cooldown" {
+		acc.Status = "active"
+		acc.LastReason = ""
+	}
 	savePoolLocked()
 	poolMu.Unlock()
 	return nil
+}
+
+// recoverExpiredTokens 后台重试被标记为 expired 的账号：临时故障恢复后
+// 账号自动变回 active，不再依赖手动点测试按钮。
+func recoverExpiredTokens() {
+	p := loadPool()
+	poolMu.Lock()
+	expired := make([]*Account, 0)
+	for _, a := range p.Accounts {
+		if a.Status == "expired" {
+			expired = append(expired, a)
+		}
+	}
+	poolMu.Unlock()
+
+	for _, a := range expired {
+		// 后台重试不再叠加内联重试，避免对确已失效的账号反复请求。
+		if err := refreshAccountTokenRetry(a, 0); err != nil {
+			continue
+		}
+		log.Printf("  token recovery: %s is active again", truncateEmail(a.Email))
+	}
+}
+
+func startTokenRecoveryLoop() {
+	go func() {
+		recoverExpiredTokens()
+		ticker := time.NewTicker(tokenRecoveryInterval)
+		for range ticker.C {
+			recoverExpiredTokens()
+		}
+	}()
 }
 
 func pickAccount() *Account {

@@ -17,6 +17,10 @@
 - Responses API 将 `reasoning.effort` 映射为上游 `reasoning_effort`，并针对 GLM 默认启用思考。
 - Responses/chat 转换兼容上游 `reasoning` 字段并强制 GLM `enable_thinking`；补齐 Codex 要求的 reasoning item `summary` 字段、动态 output index 与 completed usage 结构；转发请求显式 Accept SSE；日志中间件透传 Flush，修复流式响应被缓冲或 Codex 丢弃导致无思考/超时的问题。
 - 管理台账号测试不再仅凭 HTTP 200 判定可用：探测请求会校验 JSON／SSE 中的有效 assistant 回复，识别 HTTP 200 内嵌限流错误，并保留失败前的账号状态。
+- 账号 token 刷新按错误类型区分：仅上游返回 `invalid_grant` 才标记 `expired`；DNS／网络中断、EOF、5xx 等临时故障保留原状态，并对临时故障最多重试 2 次（退避 0.5s／1s），`invalid_grant` 不重试。
+- 新增后台 token 恢复循环：每 10 分钟重试一次 `expired` 账号，恢复后自动转回 `active`，不再依赖手动点测试按钮。
+- token 刷新成功不再无条件写回 `active`，避免抹掉 429 冷却状态；管理台测试按钮与代理 401 分支遇到临时刷新故障时保留原状态。
+- token 刷新按账号加锁串行化，避免并发刷新争抢轮换后的 refresh token 而被误判为 `invalid_grant`。
 
 ## 进行中
 
@@ -39,6 +43,9 @@
 - 本地实测：代理 chat 流 5 次连续返回 reasoning，`go test ./...`、`go build -o cline-proxy .` 和 `git diff --check` 通过。
 - Codex CLI 0.144.1 端到端验证：修复前持续报告 `ReasoningSummaryDelta without active item`；修复后复杂请求正常产出 reasoning 与 agent message，且不再出现该错误。
 - 管理台探测回归测试：HTTP 200 但只有 reasoning、空响应、SSE 错误均不会恢复账号；有效文本／tool call 才会标记可用；`go test ./...`、`go test -race ./...`、构建和 `git diff --check` 通过。
+- `docker-compose.yml` 默认注入 `ADMIN_PASSWORD`，本地使用前可直接修改密码。
 - 2026-09-02 11:11（+0800）使用修复版隔离实例逐个真实调用管理接口测试 9 个账号：外层 HTTP 均为 200，但上游 HTTP 均为 429；JSON 均为 `success=false`、`data.status=cooldown`、`probeValid=false`，持久化状态均保持为 `cooldown`，未发生误恢复。
 - 2026-09-02 12:02（+0800）再次逐个真实调用 9 个账号：账号 4、5 上游 HTTP 200 且收到有效回复，`success=true`、`status=active`、`probeValid=true` 并持久化为 active；其余 7 个上游 HTTP 429，均返回 `success=false`、`status=cooldown`、`probeValid=false`，接口语义和状态转换核验全部通过。
 - 2026-09-02 17:56（+0800）账号次数与请求日志耗时回归验证：`go test ./...`、`go test -race ./...`、构建和 `git diff --check` 通过；次数持久化/跨日重置及日志中间件耗时记录测试通过。
+- 2026-09-22 本地实测：使用已配置 API Key 调用 `z-ai/glm-5.3-flash` 的 `/v1/chat/completions`，`max_tokens=256` 返回 HTTP 200、`finish_reason=stop` 和正文 `4`；`max_tokens=16` 仅返回思考内容并因长度限制结束，非中转失败。
+- 2026-09-23 账号过期误判回归：临时故障不改变账号状态且按 1+2 次请求重试；`invalid_grant` 立即标记 expired 且不重试；刷新成功保留 cooldown；恢复循环能把 expired 账号转回 active；管理台测试按钮在临时故障时保留原状态。`go test ./...`、`go test -race ./...`、`go vet ./...`、`go build -o /tmp/cline-proxy-verify .` 和 `git diff --check` 均通过。真实上游网络故障下的端到端恢复未验证。

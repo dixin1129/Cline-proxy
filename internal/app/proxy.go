@@ -6,6 +6,7 @@ import (
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -68,6 +69,7 @@ func StartProxy(host string, port int) error {
 
 	startModelsRefresher()
 	startZenModelsRefresher()
+	startTokenRecoveryLoop()
 	initStats()
 	LoadRequestLogsFromFile()
 	go cleanupCompactStates()
@@ -587,10 +589,14 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 				return nil, acc, fmt.Errorf("account %s token expired permanently", acc.Email)
 			}
 		} else {
-			poolMu.Lock()
-			acc.Status = "expired"
-			savePoolLocked()
-			poolMu.Unlock()
+			// 刷新失败已由 refreshAccountToken 按错误类型处理：只有
+			// invalid_grant 才是永久过期的确凿证据，网络故障保留原状态。
+			if errors.Is(err, cline.ErrRefreshTokenInvalid) {
+				poolMu.Lock()
+				acc.Status = "expired"
+				savePoolLocked()
+				poolMu.Unlock()
+			}
 			return nil, acc, fmt.Errorf("account %s refresh failed: %w", acc.Email, err)
 		}
 	}

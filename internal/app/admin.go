@@ -7,6 +7,7 @@ import (
 	"cline-go-proxy/internal/kit"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -673,6 +674,17 @@ func testAccount(acc *Account) (map[string]any, string) {
 	// 取 token（expired/cooldown 也尝试刷新，测试按钮不因状态直接拒绝）
 	token, err := ensureAccountToken(acc)
 	if err != nil {
+		// 只有 refresh token 真的失效才标过期；网络抖动等临时故障不能误判。
+		if !errors.Is(err, cline.ErrRefreshTokenInvalid) {
+			restorePreviousState()
+			return map[string]any{
+				"accountId":  acc.AccountID,
+				"email":      acc.Email,
+				"status":     "error",
+				"reason":     "token refresh failed: " + err.Error(),
+				"prevStatus": prevStatus,
+			}, "error"
+		}
 		poolMu.Lock()
 		acc.LastReason = "token refresh failed: " + err.Error()
 		acc.Status = "expired"

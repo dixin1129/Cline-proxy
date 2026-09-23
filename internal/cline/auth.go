@@ -3,6 +3,7 @@ package cline
 import (
 	"cline-go-proxy/internal/kit"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -18,6 +19,10 @@ const (
 	workosAuthenticateURL = "https://api.workos.com/user_management/authenticate"
 	ClineAPIBase         = "https://api.cline.bot/api/v1"
 )
+
+// ErrRefreshTokenInvalid 表示 refresh token 永久失效（invalid_grant），
+// 需要重新登录；其它错误（网络、5xx 等）属于可重试的临时故障。
+var ErrRefreshTokenInvalid = errors.New("refresh token invalid")
 
 type credentials struct {
 	RefreshToken string `json:"refreshToken"`
@@ -218,7 +223,11 @@ func RefreshClineToken(refreshToken string) (*clineRefreshResp, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("cline refresh failed: %d", resp.StatusCode)
+		body := kit.ReadBody(resp)
+		if strings.Contains(body, "invalid_grant") {
+			return nil, fmt.Errorf("%w: %s", ErrRefreshTokenInvalid, kit.Truncate(body, 200))
+		}
+		return nil, fmt.Errorf("cline refresh failed: %d %s", resp.StatusCode, kit.Truncate(body, 200))
 	}
 
 	var c clineRefreshResp
