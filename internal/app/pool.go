@@ -226,6 +226,12 @@ func startTokenRecoveryLoop() {
 }
 
 func pickAccount() *Account {
+	return pickAccountExcluding(nil)
+}
+
+// pickAccountExcluding 按当前策略选择一个 active 账号，同时跳过本次请求已尝试的账号。
+// 账号轮换由调用方维护 excluded，避免 fill 策略在故障重试时一直命中同一个账号。
+func pickAccountExcluding(excluded map[string]bool) *Account {
 	p := loadPool()
 	poolMu.Lock()
 
@@ -237,7 +243,7 @@ func pickAccount() *Account {
 			a.CooldownUntil = time.Time{}
 			a.LastReason = ""
 		}
-		if a.Status == "active" {
+		if a.Status == "active" && !excluded[a.AccountID] {
 			active = append(active, a)
 		}
 	}
@@ -341,6 +347,29 @@ func markAccountCooldown(acc *Account, reason string, duration time.Duration) {
 	acc.Status = "cooldown"
 	acc.CooldownUntil = time.Now().Add(duration)
 	acc.LastReason = reason
+	savePoolLocked()
+	poolMu.Unlock()
+}
+
+// restoreAccountAfterTransient 仅用于请求级的网络/5xx 临时故障重试成功，
+// 不应拿它解除 429 配额冷却。
+func restoreAccountAfterTransient(acc *Account) {
+	if acc == nil {
+		return
+	}
+	p := loadPool()
+	poolMu.Lock()
+	for _, a := range p.Accounts {
+		if a.AccountID != acc.AccountID {
+			continue
+		}
+		if a.Status == "cooldown" {
+			a.Status = "active"
+			a.CooldownUntil = time.Time{}
+			a.LastReason = ""
+		}
+		break
+	}
 	savePoolLocked()
 	poolMu.Unlock()
 }

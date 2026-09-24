@@ -2,7 +2,9 @@ package app
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -330,6 +332,13 @@ func (s *responsesSSEWriter) event(event string, data any) {
 	}
 }
 
+func (s *responsesSSEWriter) heartbeat() {
+	_, _ = io.WriteString(s.w, ": keep-alive\n\n")
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+}
+
 // callAccumulator 累积单个工具调用的流式片段。
 // 上游用 index 区分并行调用; 缺失 index 时按 call_id / name 归并，
 // 绝不把多个调用的 arguments 拼进同一个字符串。
@@ -524,6 +533,13 @@ func intField(m map[string]any, key string) int {
 // chatStreamToResponses 将上游 chat.completions SSE 流转换为 Responses SSE 流。
 // onUsage 用于账号记账；fallbackInputTokens 是上游未给 usage 时的入站请求估算值。
 func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), fallbackInputTokens int, reqModel string) {
+	chatStreamToResponsesContext(context.Background(), w, upstream, onUsage, fallbackInputTokens, reqModel)
+}
+
+// chatStreamToResponsesContext 将上游 Chat Completions SSE 转为 Responses SSE。
+// 只有收到 [DONE] 且没有上游错误时才发送 response.completed。
+func chatStreamToResponsesContext(ctx context.Context, w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), fallbackInputTokens int, reqModel string) {
+	defer upstream.Body.Close()
 	model := reqModel
 	s := newResponsesSSE(w)
 	s.event("response.created", map[string]any{
@@ -626,166 +642,211 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 		})
 	}
 
-	reader := bufio.NewReader(upstream.Body)
-	for {
-		line, err := reader.ReadString('\n')
-		if line != "" {
-			line = strings.TrimRight(line, "\r\n")
-			if strings.HasPrefix(line, "data:") {
-				payload := strings.TrimSpace(line[5:])
-				if payload == "" || payload == "[DONE]" {
-					if err != nil {
-						break
-					}
-					continue
-				}
-				var obj map[string]any
-				if json.Unmarshal([]byte(payload), &obj) != nil {
-					if err != nil {
-						break
-					}
-					continue
-				}
-				if data, ok := obj["data"]; ok {
-					if d, ok := data.(map[string]any); ok {
-						obj = d
-					}
-				}
-				if m, ok := obj["model"].(string); ok && m != "" {
-					model = m
-				}
-				if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
-					usage.observe(u)
-					if onUsage != nil {
-						onUsage(u)
-					}
-				}
-				choices, _ := obj["choices"].([]any)
-				if len(choices) == 0 {
-					if err != nil {
-						break
-					}
-					continue
-				}
-				ch, _ := choices[0].(map[string]any)
-				if ch == nil {
-					if err != nil {
-						break
-					}
-					continue
-				}
-				delta, _ := ch["delta"].(map[string]any)
-				if delta == nil {
-					delta = ch
-				}
-				// 文本
-				if c, ok := delta["content"].(string); ok && c != "" {
-					if !textEmitted {
-						textEmitted = true
-						closeReasoning()
-						messageIndex = allocIndex()
-						s.event("response.output_item.added", map[string]any{
-							"type":         "response.output_item.added",
-							"output_index": messageIndex,
-							"item":         map[string]any{"id": messageID, "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
-						})
-						s.event("response.content_part.added", map[string]any{
-							"type":          "response.content_part.added",
-							"item_id":       messageID,
-							"output_index":  messageIndex,
-							"content_index": 0,
-							"part":          map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
-						})
-					}
-					outText.WriteString(c)
-					s.event("response.output_text.delta", map[string]any{
-						"type":          "response.output_text.delta",
-						"item_id":       messageID,
-						"output_index":  messageIndex,
-						"content_index": 0,
-						"delta":         c,
-					})
-				}
-				// 推理
-				r, _ := delta["reasoning_content"].(string)
-				if r == "" {
-					r, _ = delta["reasoning"].(string)
-				}
-				if r != "" {
-					if !reasoningEmitted {
-						reasoningEmitted = true
-						reasoningIndex = allocIndex()
-						s.event("response.output_item.added", map[string]any{
-							"type":         "response.output_item.added",
-							"output_index": reasoningIndex,
-							"item": map[string]any{
-								"id":                reasoningID,
-								"type":              "reasoning",
-								"status":            "in_progress",
-								"summary":           []any{},
-								"encrypted_content": nil,
-							},
-						})
-						s.event("response.reasoning_summary_part.added", map[string]any{
-							"type":          "response.reasoning_summary_part.added",
-							"item_id":       reasoningID,
-							"output_index":  reasoningIndex,
-							"summary_index": 0,
-							"part": map[string]any{
-								"type": "summary_text",
-								"text": "",
-							},
-						})
-					}
-					reasoningText.WriteString(r)
-					s.event("response.reasoning_summary_text.delta", map[string]any{
-						"type":          "response.reasoning_summary_text.delta",
-						"item_id":       reasoningID,
-						"output_index":  reasoningIndex,
-						"summary_index": 0,
-						"content_index": 0,
-						"delta":         r,
-					})
-				}
-				// 工具调用：按 index / call_id 分桶，避免并行调用的 arguments 被拼接
-				if tc, ok := delta["tool_calls"].([]any); ok {
-					for _, c := range tc {
-						cm, ok := c.(map[string]any)
-						if !ok {
-							continue
-						}
-						var idxPtr *int
-						if raw, ok := cm["index"].(float64); ok {
-							i := int(raw)
-							idxPtr = &i
-						}
-						id, _ := cm["id"].(string)
-						var name, args string
-						hasName := false
-						if fn, ok := cm["function"].(map[string]any); ok {
-							if n, ok := fn["name"].(string); ok && n != "" {
-								name, hasName = n, true
-							}
-							if a, ok := fn["arguments"].(string); ok {
-								args = a
-							}
-						}
-						acc := calls.slot(idxPtr, id, name, hasName)
-						if hasName {
-							acc.name = name
-						}
-						if id != "" {
-							calls.bindID(acc, id)
-						}
-						if args != "" {
-							acc.args.WriteString(args)
-						}
-						emitCall(acc)
-					}
-				}
+	lines, stopLines := readStreamLines(upstream.Body)
+	defer stopLines()
+	idleTimer := newStreamIdleTimer()
+	defer stopStreamIdleTimer(idleTimer)
+	var heartbeat <-chan time.Time
+	var ticker *time.Ticker
+	if streamHeartbeatInterval > 0 {
+		ticker = time.NewTicker(streamHeartbeatInterval)
+		defer ticker.Stop()
+		heartbeat = ticker.C
+	}
+	var idle <-chan time.Time
+	if idleTimer != nil {
+		idle = idleTimer.C
+	}
+
+	sawDone := false
+	streamErr := error(nil)
+	processLine := func(rawLine string) {
+		line := strings.TrimRight(rawLine, "\r\n")
+		if !strings.HasPrefix(line, "data:") {
+			return
+		}
+		payload := strings.TrimSpace(line[5:])
+		if payload == "" {
+			return
+		}
+		if payload == "[DONE]" {
+			sawDone = true
+			return
+		}
+
+		var obj map[string]any
+		if json.Unmarshal([]byte(payload), &obj) != nil {
+			return
+		}
+		if errPayload, ok := obj["error"]; ok {
+			encoded, _ := json.Marshal(errPayload)
+			streamErr = fmt.Errorf("upstream error: %s", encoded)
+			return
+		}
+		if data, ok := obj["data"]; ok {
+			if d, ok := data.(map[string]any); ok {
+				obj = d
 			}
 		}
-		if err != nil {
+		if errPayload, ok := obj["error"]; ok {
+			encoded, _ := json.Marshal(errPayload)
+			streamErr = fmt.Errorf("upstream error: %s", encoded)
+			return
+		}
+		if m, ok := obj["model"].(string); ok && m != "" {
+			model = m
+		}
+		if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+			usage.observe(u)
+			if onUsage != nil {
+				onUsage(u)
+			}
+		}
+		choices, _ := obj["choices"].([]any)
+		if len(choices) == 0 {
+			return
+		}
+		ch, _ := choices[0].(map[string]any)
+		if ch == nil {
+			return
+		}
+		delta, _ := ch["delta"].(map[string]any)
+		if delta == nil {
+			delta = ch
+		}
+
+		if c, ok := delta["content"].(string); ok && c != "" {
+			if !textEmitted {
+				textEmitted = true
+				closeReasoning()
+				messageIndex = allocIndex()
+				s.event("response.output_item.added", map[string]any{
+					"type":         "response.output_item.added",
+					"output_index": messageIndex,
+					"item":         map[string]any{"id": messageID, "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
+				})
+				s.event("response.content_part.added", map[string]any{
+					"type":          "response.content_part.added",
+					"item_id":       messageID,
+					"output_index":  messageIndex,
+					"content_index": 0,
+					"part":          map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+				})
+			}
+			outText.WriteString(c)
+			s.event("response.output_text.delta", map[string]any{
+				"type":          "response.output_text.delta",
+				"item_id":       messageID,
+				"output_index":  messageIndex,
+				"content_index": 0,
+				"delta":         c,
+			})
+		}
+
+		r, _ := delta["reasoning_content"].(string)
+		if r == "" {
+			r, _ = delta["reasoning"].(string)
+		}
+		if r != "" {
+			if !reasoningEmitted {
+				reasoningEmitted = true
+				reasoningIndex = allocIndex()
+				s.event("response.output_item.added", map[string]any{
+					"type":         "response.output_item.added",
+					"output_index": reasoningIndex,
+					"item": map[string]any{
+						"id":                reasoningID,
+						"type":              "reasoning",
+						"status":            "in_progress",
+						"summary":           []any{},
+						"encrypted_content": nil,
+					},
+				})
+				s.event("response.reasoning_summary_part.added", map[string]any{
+					"type":          "response.reasoning_summary_part.added",
+					"item_id":       reasoningID,
+					"output_index":  reasoningIndex,
+					"summary_index": 0,
+					"part":          map[string]any{"type": "summary_text", "text": ""},
+				})
+			}
+			reasoningText.WriteString(r)
+			s.event("response.reasoning_summary_text.delta", map[string]any{
+				"type":          "response.reasoning_summary_text.delta",
+				"item_id":       reasoningID,
+				"output_index":  reasoningIndex,
+				"summary_index": 0,
+				"content_index": 0,
+				"delta":         r,
+			})
+		}
+
+		if tc, ok := delta["tool_calls"].([]any); ok {
+			for _, c := range tc {
+				cm, ok := c.(map[string]any)
+				if !ok {
+					continue
+				}
+				var idxPtr *int
+				if raw, ok := cm["index"].(float64); ok {
+					i := int(raw)
+					idxPtr = &i
+				}
+				id, _ := cm["id"].(string)
+				var name, args string
+				hasName := false
+				if fn, ok := cm["function"].(map[string]any); ok {
+					if n, ok := fn["name"].(string); ok && n != "" {
+						name, hasName = n, true
+					}
+					if a, ok := fn["arguments"].(string); ok {
+						args = a
+					}
+				}
+				acc := calls.slot(idxPtr, id, name, hasName)
+				if hasName {
+					acc.name = name
+				}
+				if id != "" {
+					calls.bindID(acc, id)
+				}
+				if args != "" {
+					acc.args.WriteString(args)
+				}
+				emitCall(acc)
+			}
+		}
+	}
+
+	for {
+		select {
+		case <-streamContextDone(ctx):
+			_ = upstream.Body.Close()
+			return
+		case <-heartbeat:
+			s.heartbeat()
+		case <-idle:
+			streamErr = fmt.Errorf("upstream stream idle for %s", streamReadIdleTimeout)
+			_ = upstream.Body.Close()
+		case result, ok := <-lines:
+			if !ok {
+				if streamErr == nil && !sawDone {
+					streamErr = io.ErrUnexpectedEOF
+				}
+				break
+			}
+			if result.line != "" {
+				resetStreamIdleTimer(idleTimer)
+				processLine(result.line)
+			}
+			if result.err != nil {
+				if result.err != io.EOF && result.err != bufio.ErrBufferFull {
+					streamErr = result.err
+				}
+				break
+			}
+		}
+		if streamErr != nil || sawDone {
 			break
 		}
 	}
@@ -821,6 +882,41 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 	if u.estimated {
 		log.Printf("  responses usage: upstream not provided, estimated input=%d output=%d", u.inputTokens, u.outputTokens)
 	}
+	usagePayload := map[string]any{
+		"input_tokens": u.inputTokens,
+		"input_tokens_details": map[string]any{
+			"cached_tokens": u.cachedTokens,
+		},
+		"output_tokens": u.outputTokens,
+		"output_tokens_details": map[string]any{
+			"reasoning_tokens": u.reasoningTokens,
+		},
+		"total_tokens": u.totalTokens,
+	}
+	if streamErr != nil || !sawDone {
+		if streamErr == nil {
+			streamErr = io.ErrUnexpectedEOF
+		}
+		log.Printf("  responses upstream stream failed before [DONE]: %v", streamErr)
+		s.event("response.failed", map[string]any{
+			"type": "response.failed",
+			"response": map[string]any{
+				"id":          s.respID,
+				"object":      "response",
+				"created_at":  time.Now().Unix(),
+				"status":      "failed",
+				"model":       model,
+				"output":      outputItems,
+				"output_text": outText.String(),
+				"usage":       usagePayload,
+				"error": map[string]any{
+					"code":    "upstream_stream_error",
+					"message": streamErr.Error(),
+				},
+			},
+		})
+		return
+	}
 	s.event("response.completed", map[string]any{
 		"type": "response.completed",
 		"response": map[string]any{
@@ -831,17 +927,7 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			"model":       model,
 			"output":      outputItems,
 			"output_text": outText.String(),
-			"usage": map[string]any{
-				"input_tokens": u.inputTokens,
-				"input_tokens_details": map[string]any{
-					"cached_tokens": u.cachedTokens,
-				},
-				"output_tokens": u.outputTokens,
-				"output_tokens_details": map[string]any{
-					"reasoning_tokens": u.reasoningTokens,
-				},
-				"total_tokens": u.totalTokens,
-			},
+			"usage":       usagePayload,
 		},
 	})
 }
@@ -929,9 +1015,10 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("X-Accel-Buffering", "no")
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.WriteHeader(http.StatusOK)
-			chatStreamToResponses(w, resp, nil, estimateJSON(chat), chatModel)
+			chatStreamToResponsesContext(r.Context(), w, resp, nil, estimateJSON(chat), chatModel)
 			return
 		}
 		var raw map[string]any
@@ -948,11 +1035,9 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	if !isStream && modelNeedsStream(normalizeRequestModel(chatModel)) {
 		stream = true
 	}
-	up, acc, err := callClineAPI(chat, stream)
+	up, acc, err := callClineAPIContext(r.Context(), chat, stream)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "api_error"},
-		})
+		writeClineAPIError(w, err)
 		return
 	}
 	defer up.Body.Close()
@@ -966,14 +1051,18 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.WriteHeader(http.StatusOK)
-		chatStreamToResponses(w, up, usageFnWithLog, estimateJSON(chat), chatModel)
+		chatStreamToResponsesContext(r.Context(), w, up, usageFnWithLog, estimateJSON(chat), chatModel)
 		return
 	}
 	if stream {
-		out, err := collectStreamResponse(up)
+		out, err := collectStreamResponseContext(r.Context(), up)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}

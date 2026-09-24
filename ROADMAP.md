@@ -28,6 +28,9 @@
 - 非流式 Responses 响应补齐 reasoning item 与 usage 字段结构，兼容 `reasoning_content`／`reasoning` 与 `completion_tokens_details.reasoning_tokens`。
 - 非流式 Responses 在上游缺失 usage 时也按请求体、正文、reasoning 和工具参数估算，避免聚合路径重新回到 token=0。
 - token 估算改为按字符类别计价（CJK 按 1 token、其余按 4 字符 ≈ 1 token），替代原先的 JSON 字节数 / 4，避免中文会话被严重低估。
+- Cline 上游请求最多总计尝试 3 次：429（含 500 中嵌入的 `INFERENCE_CAP_ERROR`）按账号冷却并切换，5xx／网络故障短暂冷却后重试；最终向客户端保留 429／5xx／网关错误状态码。
+- Cline 上游请求绑定客户端 `context.Context`，客户端断开后取消上游请求；普通 Chat、Responses 和 Anthropic 流统一增加 `X-Accel-Buffering: no` 与 15 秒 SSE 心跳。
+- 流式响应区分正常 `[DONE]` 和异常 EOF／上游错误／读空闲超时；Responses 异常结束发送 `response.failed`，不再伪造 `response.completed`。
 
 ## 进行中
 
@@ -37,8 +40,6 @@
 
 - 公网部署时配置 HTTPS 反向代理，并限制 `/admin/` 访问来源。
 - 确认公网 API Key 强制校验和访问限流策略。
-- 长流式请求的 SSE 心跳（计划 15 秒）与读空闲上限；上游中途失败时改发 `response.failed` 而不是伪造 `response.completed`。
-- cline 上游 429／`INFERENCE_CAP_ERROR` 保留原始状态码并按账号切换重试（总计 3 次），避免一个账号到限额就整轮失败。
 - `responsesToChat` 目前丢弃 client 的 `parallel_tool_calls` 等字段，评估是否需要透传。
 
 ## 最近验证
@@ -61,3 +62,4 @@
 - 2026-09-23 账号过期误判回归：临时故障不改变账号状态且按 1+2 次请求重试；`invalid_grant` 立即标记 expired 且不重试；刷新成功保留 cooldown；恢复循环能把 expired 账号转回 active；管理台测试按钮在临时故障时保留原状态。`go test ./...`、`go test -race ./...`、`go vet ./...`、`go build -o /tmp/cline-proxy-verify .` 和 `git diff --check` 均通过。真实上游网络故障下的端到端恢复未验证。
 - 2026-09-24 Responses tool call 与 usage 修复：新增单元测试覆盖并行调用拆分、参数跨 delta 累积、无 `index` 时按 `call_id` 分桶、晚到 `call_id` 绑定、残缺调用跳过、唯一 `output_index`、非流式/流式 usage 透传与缺失时估算；其中一条回归样例直接取自 2026-09-23 真实会话中被拼坏的 `exec_command` 参数。`go test ./...`、`go test -race ./...`、`go vet ./...`、`go build`、`git diff --check` 均通过。
 - 2026-09-24 真实上游端到端验证（隔离实例 + 独立数据目录，未影响现有部署）：`/v1/responses` 流式请求返回上游真实 usage（input 33／output 55／reasoning 52），日志无估算标记；真实并行工具调用返回两个独立合法 JSON 的 `function_call`。Codex CLI 0.153.4 端到端：普通对话上报 `tokens used 6,879`（`input=6841 output=38`，修复前恒为 0），并行 `pwd`／`date` 场景两次调用同时执行（789ms／796ms），会话记录零参数解析错误。
+- 2026-09-24 P2／P3 回归验证：账号额度错误切换、网络故障总计 3 次重试、最终错误状态码保留、Responses 异常 EOF／15 秒心跳（测试缩短为 5ms）均有测试覆盖；`go test ./...`、`go test -race ./...`、`go vet ./...`、构建和 `git diff --check` 均通过。

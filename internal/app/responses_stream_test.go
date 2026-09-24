@@ -2,8 +2,13 @@ package app
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // collectCompleted 跑完一次流式转换，返回全部事件。
@@ -310,4 +315,70 @@ func TestChatToResponsesEstimatesMissingUsage(t *testing.T) {
 	if usage["total_tokens"].(int) != usage["input_tokens"].(int)+usage["output_tokens"].(int) {
 		t.Fatalf("total_tokens = %v, want input+output", usage["total_tokens"])
 	}
+}
+
+func TestChatStreamToResponsesFailsOnUnexpectedEOF(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	upstream := &http.Response{Body: io.NopCloser(strings.NewReader(
+		`data: {"model":"m","choices":[{"delta":{"content":"partial"}}]}` + "\n\n",
+	))}
+	chatStreamToResponses(recorder, upstream, nil, 10, "m")
+	events := decodeResponseEvents(t, recorder.Body.String())
+
+	failed := findResponseEvent(t, events, "response.failed", nil)
+	response := failed["response"].(map[string]any)
+	if response["status"] != "failed" {
+		t.Fatalf("response.status = %v, want failed", response["status"])
+	}
+	for _, event := range events {
+		if event["type"] == "response.completed" {
+			t.Fatal("unexpected response.completed after EOF without [DONE]")
+		}
+	}
+}
+
+type heartbeatBody struct {
+	mu       sync.Mutex
+	first    bool
+	released chan struct{}
+	once     sync.Once
+}
+
+func (b *heartbeatBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	first := b.first
+	if !first {
+		b.first = true
+	}
+	b.mu.Unlock()
+	if !first {
+		return copy(p, "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"), nil
+	}
+	<-b.released
+	return 0, io.EOF
+}
+
+func (b *heartbeatBody) Close() error {
+	b.once.Do(func() { close(b.released) })
+	return nil
+}
+
+func TestChatStreamToResponsesSendsHeartbeatWhileUpstreamIsIdle(t *testing.T) {
+	oldHeartbeat := streamHeartbeatInterval
+	oldIdle := streamReadIdleTimeout
+	t.Cleanup(func() {
+		streamHeartbeatInterval = oldHeartbeat
+		streamReadIdleTimeout = oldIdle
+	})
+	streamHeartbeatInterval = 5 * time.Millisecond
+	streamReadIdleTimeout = 25 * time.Millisecond
+
+	recorder := httptest.NewRecorder()
+	body := &heartbeatBody{released: make(chan struct{})}
+	chatStreamToResponses(recorder, &http.Response{Body: body}, nil, 10, "m")
+	if !strings.Contains(recorder.Body.String(), ": keep-alive\n\n") {
+		t.Fatalf("stream did not contain heartbeat: %q", recorder.Body.String())
+	}
+	events := decodeResponseEvents(t, recorder.Body.String())
+	findResponseEvent(t, events, "response.failed", nil)
 }

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,7 +24,11 @@ var proxyListenAddress = "0.0.0.0:3457"
 const (
 	defaultMaxTokens       = 128000
 	defaultReasoningEffort = "high"
+	clineMaxAttempts       = 3
+	clineTransientCooldown = 30 * time.Second
 )
+
+var clineRetryDelay = 250 * time.Millisecond
 
 var passThroughKeys = []string{
 	"tools", "tool_choice", "parallel_tool_calls", "functions", "function_call",
@@ -235,12 +240,10 @@ func StartProxy(host string, port int) error {
 			}
 		}
 
-		resp, acc, err := callClineAPI(params, upstreamStream)
+		resp, acc, err := callClineAPIContext(r.Context(), params, upstreamStream)
 		if err != nil {
 			log.Printf("  api error: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": map[string]string{"message": err.Error(), "type": "api_error"},
-			})
+			writeClineAPIError(w, err)
 			return
 		}
 		defer resp.Body.Close()
@@ -252,15 +255,18 @@ func StartProxy(host string, port int) error {
 		}
 
 		if isStream {
-			handleStreamResponseWithUsage(w, resp, usageFnWithLog)
+			handleStreamResponseWithUsageContext(r.Context(), w, resp, usageFnWithLog)
 			return
 		}
 
 		if upstreamStream {
-			out, err := collectStreamResponse(resp)
+			out, err := collectStreamResponseContext(r.Context(), resp)
 			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{
-					"error": map[string]string{"message": err.Error(), "type": "parse_error"},
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return
+				}
+				writeJSON(w, http.StatusBadGateway, map[string]any{
+					"error": map[string]string{"message": err.Error(), "type": "api_error"},
 				})
 				return
 			}
@@ -355,6 +361,24 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	json.NewEncoder(w).Encode(data)
 }
 
+// writeClineAPIError 将上游失败映射为客户端可判断的状态码，避免把
+// 额度耗尽、上游网关错误和账号池不可用全部伪装成 HTTP 500。
+func writeClineAPIError(w http.ResponseWriter, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	status := http.StatusBadGateway
+	if apiErr := new(clineAPIError); errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode <= 599 {
+		status = apiErr.StatusCode
+	}
+	writeJSON(w, status, map[string]any{
+		"error": map[string]string{
+			"message": err.Error(),
+			"type":    "api_error",
+		},
+	})
+}
+
 // applyOverride 用 override.md 替换系统提示词(不存在则跳过)
 func applyOverride(params map[string]any) {
 	override := loadOverrideContent()
@@ -439,7 +463,7 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 	}
 
 	if isStream {
-		handleStreamResponseWithUsage(w, resp, usageFn)
+		handleStreamResponseWithUsageContext(r.Context(), w, resp, usageFn)
 		tracker.finish(true, resp.StatusCode)
 		return
 	}
@@ -527,98 +551,277 @@ func clineHeaders(token, sessionID string) http.Header {
 	return h
 }
 
-func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account, error) {
-	acc := pickAccount()
-	if acc == nil {
-		return nil, nil, fmt.Errorf("no active accounts available: %s", describePoolStatus())
-	}
+// clineAPIError 保留上游或代理侧可返回给客户端的 HTTP 状态码。
+type clineAPIError struct {
+	StatusCode int
+	Message    string
+	Cause      error
+}
 
-	token, err := ensureAccountToken(acc)
-	if err != nil {
-		// Try other accounts
-		return nil, nil, fmt.Errorf("account %s token failed: %w", acc.Email, err)
+func (e *clineAPIError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Cause != nil {
+		return e.Message + ": " + e.Cause.Error()
+	}
+	return e.Message
+}
+
+func (e *clineAPIError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func newClineAPIError(status int, message string, cause error) error {
+	return &clineAPIError{StatusCode: status, Message: message, Cause: cause}
+}
+
+// callClineAPI 保留给没有客户端请求上下文的内部调用；HTTP handler 使用
+// callClineAPIContext，把客户端断开传递给上游请求。
+func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account, error) {
+	return callClineAPIContext(context.Background(), params, stream)
+}
+
+// callClineAPIContext 调用 Cline 上游，最多总计尝试 3 次。
+//
+// 429（包括 HTTP 500 中嵌入 INFERENCE_CAP_ERROR）会冷却当前账号并切换账号；
+// 5xx 和网络错误会短暂冷却当前账号后重试；客户端取消不会被伪装成上游错误。
+func callClineAPIContext(ctx context.Context, params map[string]any, stream bool) (*http.Response, *Account, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	body := buildUpstreamBody(params, stream)
 	sessionID, _ := body["session_id"].(string)
-
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
-		return nil, acc, fmt.Errorf("marshal body: %w", err)
+		return nil, nil, fmt.Errorf("marshal body: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", cline.ClineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
-	if err != nil {
-		return nil, acc, fmt.Errorf("create request: %w", err)
-	}
-	req.Header = clineHeaders(token, sessionID)
-	req.Header.Set("Accept", "text/event-stream")
+	attempted := map[string]bool{}
+	transientAccounts := make([]*Account, 0, clineMaxAttempts)
+	transientAccountIDs := map[string]bool{}
+	var lastAcc *Account
+	var lastErr error
 
-	toolCount := 0
-	if tools, ok := params["tools"]; ok {
-		if t, ok := tools.([]any); ok {
-			toolCount = len(t)
+	addTransientAccount := func(acc *Account) {
+		if acc == nil {
+			return
+		}
+		for _, existing := range transientAccounts {
+			if existing.AccountID == acc.AccountID {
+				return
+			}
+		}
+		transientAccounts = append(transientAccounts, acc)
+		transientAccountIDs[acc.AccountID] = true
+	}
+
+	waitRetry := func(attempt int) error {
+		if clineRetryDelay <= 0 || attempt >= clineMaxAttempts {
+			return nil
+		}
+		delay := time.Duration(attempt) * clineRetryDelay
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
 		}
 	}
-	log.Printf("  upstream: account=%s stream=%v tools=%d msgs=%d max_tokens=%v effort=%v",
-		truncateEmail(acc.Email), stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"])
 
-	resp, err := kit.HTTPClient.Do(req)
-	if err != nil {
-		// 网络错误：临时短冷却 5 分钟
-		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)
-		return nil, acc, fmt.Errorf("upstream request: %w", err)
-	}
+	for attempt := 1; attempt <= clineMaxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, lastAcc, err
+		}
 
-	if resp.StatusCode == 401 {
-		resp.Body.Close()
-		// Refresh token and retry
-		if err := refreshAccountToken(acc); err == nil {
-			token = acc.AccessToken
-			req.Header = clineHeaders(token, sessionID)
-			resp, err = kit.HTTPClient.Do(req)
-			if err != nil {
-				return nil, acc, fmt.Errorf("upstream retry: %w", err)
+		acc := pickAccountExcluding(attempted)
+		if acc == nil && len(transientAccounts) > 0 {
+			// 只有所有未尝试账号都不可用时，才复用发生网络/5xx 的账号；
+			// 429 账号不会进入这个列表，避免额度耗尽后反复撞同一账号。
+			acc = transientAccounts[(attempt-1)%len(transientAccounts)]
+		}
+		if acc == nil {
+			if lastErr != nil {
+				return nil, lastAcc, lastErr
 			}
-			if resp.StatusCode == 401 {
+			return nil, nil, newClineAPIError(http.StatusServiceUnavailable,
+				"no active accounts available: "+describePoolStatus(), nil)
+		}
+		attempted[acc.AccountID] = true
+		lastAcc = acc
+
+		token, err := ensureAccountToken(acc)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, acc, ctx.Err()
+			}
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, cline.ErrRefreshTokenInvalid) {
+				status = http.StatusUnauthorized
+			} else {
+				markAccountCooldown(acc, "token refresh transient error: "+err.Error(), clineTransientCooldown)
+				addTransientAccount(acc)
+			}
+			lastErr = newClineAPIError(status, fmt.Sprintf("account %s token failed", acc.Email), err)
+			log.Printf("  upstream: account=%s token failed attempt=%d/%d: %v",
+				truncateEmail(acc.Email), attempt, clineMaxAttempts, err)
+			if err := waitRetry(attempt); err != nil {
+				return nil, acc, err
+			}
+			continue
+		}
+
+		toolCount := 0
+		if tools, ok := params["tools"]; ok {
+			if t, ok := tools.([]any); ok {
+				toolCount = len(t)
+			}
+		}
+		log.Printf("  upstream: account=%s attempt=%d/%d stream=%v tools=%d msgs=%d max_tokens=%v effort=%v",
+			truncateEmail(acc.Email), attempt, clineMaxAttempts, stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"])
+
+		doRequest := func(accessToken string) (*http.Response, error) {
+			req, err := http.NewRequestWithContext(ctx, "POST", cline.ClineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
+			if err != nil {
+				return nil, fmt.Errorf("create request: %w", err)
+			}
+			req.Header = clineHeaders(accessToken, sessionID)
+			req.Header.Set("Accept", "text/event-stream")
+			return kit.HTTPClient.Do(req)
+		}
+
+		resp, err := doRequest(token)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, acc, ctx.Err()
+			}
+			markAccountCooldown(acc, "network error: "+err.Error(), clineTransientCooldown)
+			addTransientAccount(acc)
+			lastErr = newClineAPIError(http.StatusBadGateway,
+				fmt.Sprintf("upstream request for account %s", acc.Email), err)
+			log.Printf("  upstream: account=%s network error attempt=%d/%d: %v",
+				truncateEmail(acc.Email), attempt, clineMaxAttempts, err)
+			if err := waitRetry(attempt); err != nil {
+				return nil, acc, err
+			}
+			continue
+		}
+
+		if resp.StatusCode == http.StatusUnauthorized {
+			resp.Body.Close()
+			if refreshErr := refreshAccountToken(acc); refreshErr != nil {
+				if errors.Is(refreshErr, cline.ErrRefreshTokenInvalid) {
+					poolMu.Lock()
+					acc.Status = "expired"
+					savePoolLocked()
+					poolMu.Unlock()
+				}
+				status := http.StatusServiceUnavailable
+				if errors.Is(refreshErr, cline.ErrRefreshTokenInvalid) {
+					status = http.StatusUnauthorized
+				} else {
+					markAccountCooldown(acc, "token refresh transient error: "+refreshErr.Error(), clineTransientCooldown)
+					addTransientAccount(acc)
+				}
+				lastErr = newClineAPIError(status,
+					fmt.Sprintf("account %s refresh failed", acc.Email), refreshErr)
+				log.Printf("  upstream: account=%s refresh failed after 401 attempt=%d/%d: %v",
+					truncateEmail(acc.Email), attempt, clineMaxAttempts, refreshErr)
+				if err := waitRetry(attempt); err != nil {
+					return nil, acc, err
+				}
+				continue
+			}
+
+			resp, err = doRequest(acc.AccessToken)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil, acc, ctx.Err()
+				}
+				markAccountCooldown(acc, "network error after token refresh: "+err.Error(), clineTransientCooldown)
+				addTransientAccount(acc)
+				lastErr = newClineAPIError(http.StatusBadGateway,
+					fmt.Sprintf("upstream request for account %s after token refresh", acc.Email), err)
+				if err := waitRetry(attempt); err != nil {
+					return nil, acc, err
+				}
+				continue
+			}
+			if resp.StatusCode == http.StatusUnauthorized {
 				resp.Body.Close()
 				poolMu.Lock()
 				acc.Status = "expired"
+				acc.LastReason = "upstream returned 401 after token refresh"
 				savePoolLocked()
 				poolMu.Unlock()
-				return nil, acc, fmt.Errorf("account %s token expired permanently", acc.Email)
+				lastErr = newClineAPIError(http.StatusUnauthorized,
+					fmt.Sprintf("account %s token expired permanently", acc.Email), nil)
+				if err := waitRetry(attempt); err != nil {
+					return nil, acc, err
+				}
+				continue
 			}
-		} else {
-			// 刷新失败已由 refreshAccountToken 按错误类型处理：只有
-			// invalid_grant 才是永久过期的确凿证据，网络故障保留原状态。
-			if errors.Is(err, cline.ErrRefreshTokenInvalid) {
-				poolMu.Lock()
-				acc.Status = "expired"
-				savePoolLocked()
-				poolMu.Unlock()
-			}
-			return nil, acc, fmt.Errorf("account %s refresh failed: %w", acc.Email, err)
 		}
-	}
 
-	if resp.StatusCode != 200 {
+		if resp.StatusCode == http.StatusOK {
+			if transientAccountIDs[acc.AccountID] {
+				restoreAccountAfterTransient(acc)
+			}
+			bumpUsage(acc)
+			return resp, acc, nil
+		}
+
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		// Mark account on cooldown on rate limits
-		if resp.StatusCode == 429 {
-			reason := kit.Truncate(string(bodyBytes), 500)
-			duration := parseInferenceCapDuration(string(bodyBytes))
+		bodyText := string(bodyBytes)
+		reason := kit.Truncate(bodyText, 500)
+		effectiveStatus := resp.StatusCode
+		if resp.StatusCode == http.StatusTooManyRequests || isProbeRateLimitText(bodyText) {
+			effectiveStatus = http.StatusTooManyRequests
+		}
+
+		if effectiveStatus == http.StatusTooManyRequests {
+			duration := parseInferenceCapDuration(bodyText)
 			if duration <= 0 {
 				duration = parseRetryAfter(resp.Header.Get("Retry-After"))
 			}
-			markAccountCooldown(acc, "429: "+reason, duration)
-			log.Printf("  account %s cooldown %v (reason: %s)", truncateEmail(acc.Email), duration, reason)
+			markAccountCooldown(acc, fmt.Sprintf("429: %s", reason), duration)
+			log.Printf("  account %s cooldown %v (status=%d reason=%s)",
+				truncateEmail(acc.Email), duration, resp.StatusCode, reason)
+			lastErr = newClineAPIError(http.StatusTooManyRequests,
+				fmt.Sprintf("API %d: %s", effectiveStatus, reason), nil)
+			if err := waitRetry(attempt); err != nil {
+				return nil, acc, err
+			}
+			continue
 		}
-		return nil, acc, fmt.Errorf("API %d: %s", resp.StatusCode, kit.Truncate(string(bodyBytes), 500))
+
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooEarly {
+			markAccountCooldown(acc, fmt.Sprintf("API %d: %s", resp.StatusCode, reason), clineTransientCooldown)
+			addTransientAccount(acc)
+			lastErr = newClineAPIError(effectiveStatus,
+				fmt.Sprintf("API %d: %s", effectiveStatus, reason), nil)
+			if err := waitRetry(attempt); err != nil {
+				return nil, acc, err
+			}
+			continue
+		}
+
+		return nil, acc, newClineAPIError(effectiveStatus,
+			fmt.Sprintf("API %d: %s", effectiveStatus, reason), nil)
 	}
 
-	bumpUsage(acc)
-	return resp, acc, nil
+	if lastErr != nil {
+		return nil, lastAcc, lastErr
+	}
+	return nil, lastAcc, newClineAPIError(http.StatusServiceUnavailable,
+		"upstream request failed after retries", nil)
 }
 
 func extractUsageTokens(u map[string]any) (int64, int64) {
@@ -685,9 +888,17 @@ func getMsgCount(params map[string]any) int {
 }
 
 func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
+	handleStreamResponseWithUsageContext(context.Background(), w, upstream, onUsage)
+}
+
+// handleStreamResponseWithUsageContext 转发 Chat Completions SSE，同时提供心跳、
+// 客户端取消和上游异常 EOF 处理。正常结束必须看到上游 [DONE]。
+func handleStreamResponseWithUsageContext(ctx context.Context, w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
+	defer upstream.Body.Close()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusOK)
 
@@ -697,67 +908,139 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		return
 	}
 
-	reader := bufio.NewReader(upstream.Body)
+	writeHeartbeat := func() {
+		_, _ = io.WriteString(w, ": keep-alive\n\n")
+		flusher.Flush()
+	}
+	writeFailure := func(message string) {
+		if ctx.Err() != nil {
+			return
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"error": map[string]string{
+				"message": message,
+				"type":    "api_error",
+			},
+		})
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+		flusher.Flush()
+	}
+
+	lines, stopLines := readStreamLines(upstream.Body)
+	defer stopLines()
+	idleTimer := newStreamIdleTimer()
+	defer stopStreamIdleTimer(idleTimer)
+	var heartbeat <-chan time.Time
+	var ticker *time.Ticker
+	if streamHeartbeatInterval > 0 {
+		ticker = time.NewTicker(streamHeartbeatInterval)
+		defer ticker.Stop()
+		heartbeat = ticker.C
+	}
+	var idle <-chan time.Time
+	if idleTimer != nil {
+		idle = idleTimer.C
+	}
+
+	sawDone := false
+	streamErr := error(nil)
 	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				if line != "" {
-					w.Write([]byte(line + "\n"))
+		select {
+		case <-streamContextDone(ctx):
+			_ = upstream.Body.Close()
+			return
+		case <-heartbeat:
+			writeHeartbeat()
+		case <-idle:
+			streamErr = fmt.Errorf("upstream stream idle for %s", streamReadIdleTimeout)
+			_ = upstream.Body.Close()
+		case result, ok := <-lines:
+			if !ok {
+				if streamErr == nil && !sawDone {
+					streamErr = io.ErrUnexpectedEOF
+				}
+				break
+			}
+			if result.line != "" {
+				resetStreamIdleTimer(idleTimer)
+			}
+			line := strings.TrimRight(result.line, "\r\n")
+			if line != "" {
+				if strings.HasPrefix(line, "data:") {
+					payload := strings.TrimSpace(line[5:])
+					if payload == "" || payload == "[DONE]" {
+						if payload == "[DONE]" {
+							sawDone = true
+						}
+						_, _ = io.WriteString(w, line+"\n\n")
+						flusher.Flush()
+					} else {
+						// Try to normalize the response.
+						var obj map[string]any
+						if err := json.Unmarshal([]byte(payload), &obj); err == nil {
+							if onUsage != nil {
+								if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+									onUsage(u)
+								}
+							}
+							if _, hasChoices := obj["choices"]; !hasChoices {
+								if data, ok := obj["data"].([]any); ok && len(data) > 0 {
+									if dm, ok := data[0].(map[string]any); ok {
+										if _, hasChoices := dm["choices"]; hasChoices {
+											obj = dm
+										}
+									}
+								}
+							}
+							// Some Cline responses wrap in {data: {...}}.
+							if data, ok := obj["data"]; ok {
+								if d, ok := data.(map[string]any); ok {
+									if _, hasChoices := d["choices"]; hasChoices {
+										obj = d
+									}
+									if _, hasID := d["id"]; hasID {
+										obj = d
+									}
+								}
+							}
+							normalized := normalizeOpenAIResponse(obj)
+							if normBytes, err := json.Marshal(normalized); err == nil {
+								_, _ = fmt.Fprintf(w, "data: %s\n\n", normBytes)
+								flusher.Flush()
+							} else {
+								_, _ = io.WriteString(w, line+"\n\n")
+								flusher.Flush()
+							}
+						} else {
+							_, _ = io.WriteString(w, line+"\n\n")
+							flusher.Flush()
+						}
+					}
+				} else {
+					_, _ = io.WriteString(w, line+"\n\n")
+					flusher.Flush()
 				}
 			}
+
+			if result.err != nil {
+				if result.err != io.EOF && result.err != bufio.ErrBufferFull {
+					streamErr = result.err
+				}
+				break
+			}
+		}
+		if streamErr != nil || sawDone {
 			break
 		}
+	}
 
-		line = strings.TrimRight(line, "\r\n")
-
-		if strings.HasPrefix(line, "data:") {
-			payload := strings.TrimSpace(line[5:])
-			if payload == "" || payload == "[DONE]" {
-				w.Write([]byte(line + "\n\n"))
-				flusher.Flush()
-				continue
-			}
-
-			// Try to normalize the response
-			var obj map[string]any
-			if err := json.Unmarshal([]byte(payload), &obj); err == nil {
-				if onUsage != nil {
-					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
-						onUsage(u)
-					}
-				}
-				if _, hasChoices := obj["choices"]; !hasChoices {
-					if data, ok := obj["data"].([]any); ok && len(data) > 0 {
-						if dm, ok := data[0].(map[string]any); ok {
-							if _, hasChoices := dm["choices"]; hasChoices {
-								obj = dm
-							}
-						}
-					}
-				}
-				// Some Cline responses wrap in {data: {...}}
-				if data, ok := obj["data"]; ok {
-					if d, ok := data.(map[string]any); ok {
-						if _, hasChoices := d["choices"]; hasChoices {
-							obj = d
-						}
-						if _, hasID := d["id"]; hasID {
-							obj = d
-						}
-					}
-				}
-				normalized := normalizeOpenAIResponse(obj)
-				if normBytes, err := json.Marshal(normalized); err == nil {
-					w.Write([]byte("data: " + string(normBytes) + "\n\n"))
-					flusher.Flush()
-					continue
-				}
-			}
+	if !sawDone {
+		if streamErr == nil {
+			streamErr = io.ErrUnexpectedEOF
 		}
-
-		w.Write([]byte(line + "\n"))
-		flusher.Flush()
+		log.Printf("  upstream stream failed before [DONE]: %v", streamErr)
+		writeFailure("upstream stream ended before [DONE]: " + streamErr.Error())
+		return
 	}
 }
 
@@ -798,6 +1081,11 @@ func handleNonStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Resp
 }
 
 func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
+	return collectStreamResponseContext(context.Background(), upstream)
+}
+
+func collectStreamResponseContext(ctx context.Context, upstream *http.Response) (map[string]any, error) {
+	defer upstream.Body.Close()
 	var (
 		model        string
 		content      strings.Builder
@@ -809,95 +1097,131 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 		curArgs      strings.Builder
 	)
 
-	reader := bufio.NewReader(upstream.Body)
+	lines, stopLines := readStreamLines(upstream.Body)
+	defer stopLines()
+	idleTimer := newStreamIdleTimer()
+	defer stopStreamIdleTimer(idleTimer)
+	var idle <-chan time.Time
+	if idleTimer != nil {
+		idle = idleTimer.C
+	}
+
+	sawDone := false
+	streamErr := error(nil)
 	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err != io.EOF && err != bufio.ErrBufferFull {
+		select {
+		case <-streamContextDone(ctx):
+			_ = upstream.Body.Close()
+			return nil, ctx.Err()
+		case <-idle:
+			streamErr = fmt.Errorf("upstream stream idle for %s", streamReadIdleTimeout)
+			_ = upstream.Body.Close()
+		case result, ok := <-lines:
+			if !ok {
+				if streamErr == nil && !sawDone {
+					streamErr = io.ErrUnexpectedEOF
+				}
+				break
+			}
+			if result.line != "" {
+				resetStreamIdleTimer(idleTimer)
+			}
+			line := strings.TrimRight(result.line, "\r\n")
+			if strings.HasPrefix(line, "data:") {
+				payload := strings.TrimSpace(line[5:])
+				if payload == "" || payload == "[DONE]" {
+					if payload == "[DONE]" {
+						sawDone = true
+					}
+				} else {
+					var obj map[string]any
+					if json.Unmarshal([]byte(payload), &obj) == nil {
+						if data, ok := obj["data"]; ok {
+							if d, ok := data.(map[string]any); ok {
+								obj = d
+							}
+						}
+						if errPayload, ok := obj["error"]; ok {
+							encoded, _ := json.Marshal(errPayload)
+							streamErr = fmt.Errorf("upstream error: %s", encoded)
+							break
+						}
+						if m, ok := obj["model"].(string); ok && m != "" {
+							model = m
+						}
+						if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+							usage = u
+						}
+						choices, _ := getNested(obj, "choices").([]any)
+						if len(choices) > 0 {
+							choice, _ := choices[0].(map[string]any)
+							if choice != nil {
+								delta, _ := choice["delta"].(map[string]any)
+								if delta == nil {
+									delta = choice
+								}
+								if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
+									finishReason = fr
+								}
+								if c, ok := delta["content"].(string); ok && c != "" {
+									content.WriteString(c)
+								}
+								if tcRaw, ok := delta["tool_calls"].([]any); ok {
+									for _, tc := range tcRaw {
+										tcMap, _ := tc.(map[string]any)
+										if tcMap == nil {
+											continue
+										}
+										idx := 0
+										if i, ok := tcMap["index"].(float64); ok {
+											idx = int(i)
+										}
+										if idx != toolCallIdx {
+											if curToolCall != nil {
+												curToolCall["function"].(map[string]any)["arguments"] = curArgs.String()
+												toolCalls = append(toolCalls, curToolCall)
+											}
+											curToolCall = map[string]any{
+												"id":       tcMap["id"],
+												"type":     "function",
+												"function": map[string]any{"name": "", "arguments": ""},
+											}
+											curArgs.Reset()
+											toolCallIdx = idx
+										}
+										if fn, ok := tcMap["function"].(map[string]any); ok {
+											if n, ok := fn["name"].(string); ok && n != "" {
+												curToolCall["function"].(map[string]any)["name"] = n
+											}
+											if a, ok := fn["arguments"].(string); ok && a != "" {
+												curArgs.WriteString(a)
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			if result.err != nil {
+				if result.err != io.EOF && result.err != bufio.ErrBufferFull {
+					streamErr = result.err
+				}
 				break
 			}
 		}
-		line = strings.TrimRight(line, "\r\n")
-
-		if strings.HasPrefix(line, "data:") {
-			payload := strings.TrimSpace(line[5:])
-			if payload == "" || payload == "[DONE]" {
-				if err == io.EOF {
-					break
-				}
-				continue
-			}
-			var obj map[string]any
-			if json.Unmarshal([]byte(payload), &obj) != nil {
-				continue
-			}
-			if data, ok := obj["data"]; ok {
-				if d, ok := data.(map[string]any); ok {
-					obj = d
-				}
-			}
-			if m, ok := obj["model"].(string); ok && m != "" {
-				model = m
-			}
-			if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
-				usage = u
-			}
-			choices, _ := getNested(obj, "choices").([]any)
-			if len(choices) == 0 {
-				continue
-			}
-			choice, _ := choices[0].(map[string]any)
-			if choice == nil {
-				continue
-			}
-			delta, _ := choice["delta"].(map[string]any)
-			if delta == nil {
-				delta = choice
-			}
-			if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
-				finishReason = fr
-			}
-			if c, ok := delta["content"].(string); ok && c != "" {
-				content.WriteString(c)
-			}
-			if tcRaw, ok := delta["tool_calls"].([]any); ok {
-				for _, tc := range tcRaw {
-					tcMap, _ := tc.(map[string]any)
-					if tcMap == nil {
-						continue
-					}
-					idx := 0
-					if i, ok := tcMap["index"].(float64); ok {
-						idx = int(i)
-					}
-					if idx != toolCallIdx {
-						if curToolCall != nil {
-							curToolCall["function"].(map[string]any)["arguments"] = curArgs.String()
-							toolCalls = append(toolCalls, curToolCall)
-						}
-						curToolCall = map[string]any{
-							"id":       tcMap["id"],
-							"type":     "function",
-							"function": map[string]any{"name": "", "arguments": ""},
-						}
-						curArgs.Reset()
-						toolCallIdx = idx
-					}
-					if fn, ok := tcMap["function"].(map[string]any); ok {
-						if n, ok := fn["name"].(string); ok && n != "" {
-							curToolCall["function"].(map[string]any)["name"] = n
-						}
-						if a, ok := fn["arguments"].(string); ok && a != "" {
-							curArgs.WriteString(a)
-						}
-					}
-				}
-			}
-		}
-		if err == io.EOF {
+		if streamErr != nil || sawDone {
 			break
 		}
 	}
+	if !sawDone {
+		if streamErr == nil {
+			streamErr = io.ErrUnexpectedEOF
+		}
+		return nil, fmt.Errorf("upstream stream ended before [DONE]: %w", streamErr)
+	}
+
 	if curToolCall != nil {
 		curToolCall["function"].(map[string]any)["arguments"] = curArgs.String()
 		toolCalls = append(toolCalls, curToolCall)
@@ -1462,12 +1786,10 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		log.Printf("  anthropic model %s requires stream: forcing upstream stream, will aggregate", req.Model)
 	}
 
-	resp, acc, err := callClineAPI(openAIReq, upstreamStream)
+	resp, acc, err := callClineAPIContext(r.Context(), openAIReq, upstreamStream)
 	if err != nil {
 		log.Printf("  anthropic api error: %v", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "api_error"},
-		})
+		writeClineAPIError(w, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -1479,14 +1801,17 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		handleAnthropicStreamWithUsage(w, resp, normalizeRequestModel(req.Model), toolSchemas, usageFnWithLog)
+		handleAnthropicStreamWithUsageContext(r.Context(), w, resp, normalizeRequestModel(req.Model), toolSchemas, usageFnWithLog)
 		return
 	}
 
 	if upstreamStream {
-		out, err := collectStreamResponse(resp)
+		out, err := collectStreamResponseContext(r.Context(), resp)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			writeJSON(w, http.StatusBadGateway, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 			})
 			return
@@ -1583,7 +1908,7 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 	}
 
 	if isStream {
-		handleAnthropicStreamWithUsage(w, resp, zm.ID, toolSchemas, usageFn)
+		handleAnthropicStreamWithUsageContext(r.Context(), w, resp, zm.ID, toolSchemas, usageFn)
 		tracker.finish(true, resp.StatusCode)
 		return
 	}
@@ -1615,10 +1940,16 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 }
 
 func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Response, modelName string, toolSchemas map[string]map[string]bool, onUsage func(map[string]any)) {
+	handleAnthropicStreamWithUsageContext(context.Background(), w, upstream, modelName, toolSchemas, onUsage)
+}
+
+func handleAnthropicStreamWithUsageContext(ctx context.Context, w http.ResponseWriter, upstream *http.Response, modelName string, toolSchemas map[string]map[string]bool, onUsage func(map[string]any)) {
+	defer upstream.Body.Close()
 	log.Printf("  anthropic stream: starting real-time forward")
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusOK)
 	flusher, ok := w.(http.Flusher)
@@ -1668,6 +1999,8 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 	*textIndex = -1
 	hasText := false
 	pendingTools := map[int]*toolAccumulator{}
+	sawDone := false
+	streamErr := error(nil)
 	emitIndex := 0
 	nextIndex := func() int {
 		i := emitIndex
@@ -1727,7 +2060,11 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 			return
 		}
 		payload := strings.TrimSpace(line[5:])
-		if payload == "" || payload == "[DONE]" {
+		if payload == "" {
+			return
+		}
+		if payload == "[DONE]" {
+			sawDone = true
 			return
 		}
 
@@ -1750,6 +2087,7 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 			errBody, _ := json.Marshal(errPayload)
 			log.Printf("  upstream SSE error: %s", string(errBody))
 			emit("error", map[string]any{"type": "error", "error": errPayload})
+			streamErr = fmt.Errorf("upstream error: %s", errBody)
 			return
 		}
 
@@ -1833,16 +2171,69 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 		}
 	}
 
-	reader := bufio.NewReader(upstream.Body)
+	lines, stopLines := readStreamLines(upstream.Body)
+	defer stopLines()
+	idleTimer := newStreamIdleTimer()
+	defer stopStreamIdleTimer(idleTimer)
+	var heartbeat <-chan time.Time
+	var ticker *time.Ticker
+	if streamHeartbeatInterval > 0 {
+		ticker = time.NewTicker(streamHeartbeatInterval)
+		defer ticker.Stop()
+		heartbeat = ticker.C
+	}
+	var idle <-chan time.Time
+	if idleTimer != nil {
+		idle = idleTimer.C
+	}
 
 	for {
-		line, err := reader.ReadString('\n')
-		if line != "" {
-			processSSELine(line)
+		select {
+		case <-streamContextDone(ctx):
+			_ = upstream.Body.Close()
+			return
+		case <-heartbeat:
+			_, _ = io.WriteString(w, ": keep-alive\n\n")
+			flusher.Flush()
+		case <-idle:
+			streamErr = fmt.Errorf("upstream stream idle for %s", streamReadIdleTimeout)
+			_ = upstream.Body.Close()
+		case result, ok := <-lines:
+			if !ok {
+				if streamErr == nil && !sawDone {
+					streamErr = io.ErrUnexpectedEOF
+				}
+				break
+			}
+			if result.line != "" {
+				resetStreamIdleTimer(idleTimer)
+				processSSELine(result.line)
+			}
+			if result.err != nil {
+				if result.err != io.EOF && result.err != bufio.ErrBufferFull {
+					streamErr = result.err
+				}
+				break
+			}
 		}
-		if err != nil {
+		if streamErr != nil || sawDone {
 			break
 		}
+	}
+
+	if streamErr != nil || !sawDone {
+		if streamErr == nil {
+			streamErr = io.ErrUnexpectedEOF
+		}
+		log.Printf("  anthropic upstream stream failed before [DONE]: %v", streamErr)
+		emit("error", map[string]any{
+			"type": "error",
+			"error": map[string]string{
+				"type":    "api_error",
+				"message": "upstream stream failed before [DONE]: " + streamErr.Error(),
+			},
+		})
+		return
 	}
 
 	// Stop text block if active
