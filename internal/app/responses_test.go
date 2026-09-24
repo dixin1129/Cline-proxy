@@ -15,7 +15,7 @@ func TestChatStreamToResponsesEmitsCodexCompatibleReasoningItem(t *testing.T) {
 		`{"model":"z-ai/glm-5.3-flash","choices":[{"delta":{"content":"408"}}]}`)
 	recorder := httptest.NewRecorder()
 
-	chatStreamToResponses(recorder, upstream, nil)
+	chatStreamToResponses(recorder, upstream, nil, 0, "z-ai/glm-5.3-flash")
 	events := decodeResponseEvents(t, recorder.Body.String())
 
 	reasoningAdded := findResponseEvent(t, events, "response.output_item.added", func(event map[string]any) bool {
@@ -43,7 +43,7 @@ func TestChatStreamToResponsesUsesZeroIndexWithoutReasoningAndValidUsage(t *test
 	upstream := chatSSE(`{"model":"z-ai/glm-5.3-flash","choices":[{"delta":{"content":"408"}}]}`)
 	recorder := httptest.NewRecorder()
 
-	chatStreamToResponses(recorder, upstream, nil)
+	chatStreamToResponses(recorder, upstream, nil, 0, "z-ai/glm-5.3-flash")
 	events := decodeResponseEvents(t, recorder.Body.String())
 
 	messageAdded := findResponseEvent(t, events, "response.output_item.added", func(event map[string]any) bool {

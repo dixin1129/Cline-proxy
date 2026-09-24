@@ -250,10 +250,47 @@ func generateSummary(modelID, prompt string, maxSummary int) (string, error) {
 	return "", fmt.Errorf("no content in summary response")
 }
 
-// ============ 估算(官方 Token.estimate 近似: JSON 长度 / 4) ============
+// ============ Token 估算 ============
+//
+// 官方 Token.estimate 用的是 JSON 字节数 / 4，对 ASCII 尚可，对中文严重低估
+// (一个汉字 3 字节却只按 0.75 记)。这里按字符类别分别计价：
+// CJK 字符按 1 token，其余字符按 4 字符 ≈ 1 token。
 
+// estimateTextTokens 按字符类别估算纯文本的 token 数。
+func estimateTextTokens(s string) int {
+	cjk, other := 0, 0
+	for _, r := range s {
+		if isCJK(r) {
+			cjk++
+		} else {
+			other++
+		}
+	}
+	return cjk + (other+3)/4
+}
+
+// isCJK 判断是否按 1 字符 ≈ 1 token 计价的宽字符(汉字、假名、谚文、全角符号)。
+func isCJK(r rune) bool {
+	switch {
+	case r >= 0x3040 && r <= 0x30FF: // 平假名/片假名
+		return true
+	case r >= 0x3400 && r <= 0x4DBF: // CJK 扩展 A
+		return true
+	case r >= 0x4E00 && r <= 0x9FFF: // CJK 基本区
+		return true
+	case r >= 0xF900 && r <= 0xFAFF: // CJK 兼容表意文字
+		return true
+	case r >= 0xAC00 && r <= 0xD7AF: // 谚文音节
+		return true
+	case r >= 0x20000 && r <= 0x2FA1F: // CJK 扩展 B~F 及兼容补充
+		return true
+	}
+	return false
+}
+
+// estimateText 保留原语义(JSON 长度估算的文本版)，供压缩逻辑复用。
 func estimateText(s string) int {
-	return len([]rune(s)) / 4
+	return estimateTextTokens(s)
 }
 
 func estimateJSON(v any) int {
@@ -261,7 +298,7 @@ func estimateJSON(v any) int {
 	if err != nil {
 		return 0
 	}
-	return len(b) / 4
+	return estimateTextTokens(string(b))
 }
 
 // ============ 会话状态 ============

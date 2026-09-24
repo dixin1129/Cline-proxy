@@ -21,6 +21,13 @@
 - 新增后台 token 恢复循环：每 10 分钟重试一次 `expired` 账号，恢复后自动转回 `active`，不再依赖手动点测试按钮。
 - token 刷新成功不再无条件写回 `active`，避免抹掉 429 冷却状态；管理台测试按钮与代理 401 分支遇到临时刷新故障时保留原状态。
 - token 刷新按账号加锁串行化，避免并发刷新争抢轮换后的 refresh token 而被误判为 `invalid_grant`。
+- Responses 流式转换的 tool call 改为按上游 `index`／`call_id` 分桶累积，每个调用独立对应一个 `function_call` output item；修复并行工具调用的 arguments 被拼成 `{...}{...}`、Codex 报 `failed to parse function arguments: trailing characters` 而中断对话的问题。
+- Responses 的 `output_index` 改为统一分配器发放，reasoning／message／function_call 不再复用 0 和 1，避免同轮多 item 时索引冲突。
+- Responses 的 `response.completed` 回填真实 usage（input／output／total／cached／reasoning tokens），并在 `response.output` 中带上 reasoning 与 message／function_call item。
+- 转换 Responses 请求时强制打开 `stream_options.include_usage`，主动向上游索取 token 统计；上游未提供 usage 时按入站请求与已产出内容估算兜底并在日志标记，修复客户端 `token_count` 恒为 0、上下文永不触发自动压缩的问题。
+- 非流式 Responses 响应补齐 reasoning item 与 usage 字段结构，兼容 `reasoning_content`／`reasoning` 与 `completion_tokens_details.reasoning_tokens`。
+- 非流式 Responses 在上游缺失 usage 时也按请求体、正文、reasoning 和工具参数估算，避免聚合路径重新回到 token=0。
+- token 估算改为按字符类别计价（CJK 按 1 token、其余按 4 字符 ≈ 1 token），替代原先的 JSON 字节数 / 4，避免中文会话被严重低估。
 
 ## 进行中
 
@@ -30,6 +37,9 @@
 
 - 公网部署时配置 HTTPS 反向代理，并限制 `/admin/` 访问来源。
 - 确认公网 API Key 强制校验和访问限流策略。
+- 长流式请求的 SSE 心跳（计划 15 秒）与读空闲上限；上游中途失败时改发 `response.failed` 而不是伪造 `response.completed`。
+- cline 上游 429／`INFERENCE_CAP_ERROR` 保留原始状态码并按账号切换重试（总计 3 次），避免一个账号到限额就整轮失败。
+- `responsesToChat` 目前丢弃 client 的 `parallel_tool_calls` 等字段，评估是否需要透传。
 
 ## 最近验证
 
@@ -49,3 +59,5 @@
 - 2026-09-02 17:56（+0800）账号次数与请求日志耗时回归验证：`go test ./...`、`go test -race ./...`、构建和 `git diff --check` 通过；次数持久化/跨日重置及日志中间件耗时记录测试通过。
 - 2026-09-22 本地实测：使用已配置 API Key 调用 `z-ai/glm-5.3-flash` 的 `/v1/chat/completions`，`max_tokens=256` 返回 HTTP 200、`finish_reason=stop` 和正文 `4`；`max_tokens=16` 仅返回思考内容并因长度限制结束，非中转失败。
 - 2026-09-23 账号过期误判回归：临时故障不改变账号状态且按 1+2 次请求重试；`invalid_grant` 立即标记 expired 且不重试；刷新成功保留 cooldown；恢复循环能把 expired 账号转回 active；管理台测试按钮在临时故障时保留原状态。`go test ./...`、`go test -race ./...`、`go vet ./...`、`go build -o /tmp/cline-proxy-verify .` 和 `git diff --check` 均通过。真实上游网络故障下的端到端恢复未验证。
+- 2026-09-24 Responses tool call 与 usage 修复：新增单元测试覆盖并行调用拆分、参数跨 delta 累积、无 `index` 时按 `call_id` 分桶、晚到 `call_id` 绑定、残缺调用跳过、唯一 `output_index`、非流式/流式 usage 透传与缺失时估算；其中一条回归样例直接取自 2026-09-23 真实会话中被拼坏的 `exec_command` 参数。`go test ./...`、`go test -race ./...`、`go vet ./...`、`go build`、`git diff --check` 均通过。
+- 2026-09-24 真实上游端到端验证（隔离实例 + 独立数据目录，未影响现有部署）：`/v1/responses` 流式请求返回上游真实 usage（input 33／output 55／reasoning 52），日志无估算标记；真实并行工具调用返回两个独立合法 JSON 的 `function_call`。Codex CLI 0.153.4 端到端：普通对话上报 `tokens used 6,879`（`input=6841 output=38`，修复前恒为 0），并行 `pwd`／`date` 场景两次调用同时执行（789ms／796ms），会话记录零参数解析错误。
